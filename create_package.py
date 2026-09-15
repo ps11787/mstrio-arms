@@ -70,7 +70,15 @@ myPackageSettings = PackageSettings(
 project_name = str(df['Project@Name'][0]).strip()
 migration_content_path = str(df['Migration Obj@Content Path'][0])
 shortcut_path = _normalize_mstr_folder_path(project_name, migration_content_path)
-print(shortcut_path)
+request_id = df['Request@ID'][0]
+target_project_name = str(df['Target Project@NAME'][0]).strip()
+print(
+    "Retrieved migration parameters:\n"
+    f"  Request ID: {request_id}\n"
+    f"  Source project: {project_name}\n"
+    f"  Target project: {target_project_name}\n"
+    f"  Shortcut path: {shortcut_path}"
+)
 # obtain list of shortcuts located in a scpecified folder
 shortcuts4Migration = Folder(myConn, id=_resolve_folder_id(myConn, shortcut_path, project_name)).get_contents()   # make sure to create this location and put some shortcuts there before You run this script
 
@@ -123,7 +131,6 @@ db_instance.execute_query(query = sql_query_insert_migration, project_id=project
 db_instance.execute_query(query = sql_query_upd_req_table, project_id=project_id)
 
 #package validation for target env retrieved from request
-target_project_name = str(df['Target Project@NAME'][0]).strip()
 targetENV = Connection(base_url, mstr_username, mstr_password, project_name=target_project_name)
 validation_trigger_result = current_migration.trigger_validation(
     target_env=targetENV,
@@ -184,3 +191,6 @@ sql_query_insert_validation_comment = (
     f"VALUES ((select max (comment_id) + 1 from arms.t_mig_comments),{df['Request@ID'][0]},'{validation_message_escaped}',current_timestamp,'system',0);"
 )
 db_instance.execute_query(query=sql_query_insert_validation_comment, project_id=project_id)
+
+print("Create package proces completed for Request ID: ", df['Request@ID'][0])
+
