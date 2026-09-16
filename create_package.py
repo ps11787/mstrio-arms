@@ -122,7 +122,7 @@ df = request_list.to_dataframe()
 
 # specify settings for a package
 myPackageSettings = PackageSettings(
-    Action.USE_EXISTING,
+    Action.REPLACE,
     PackageSettings.UpdateSchema.UPDATE_SCHEMA_LOGICAL_INFO,
     PackageSettings.AclOnReplacingObjects.USE_EXISTING,
     PackageSettings.AclOnNewObjects.INHERIT_ACL_AS_DEST_FOLDER
