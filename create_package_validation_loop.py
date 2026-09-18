@@ -4,8 +4,11 @@ from mstrio.project_objects.report import Report
 from mstrio.object_management.folder import Folder, get_folder_id_from_path, list_folders
 from mstrio.object_management.migration.package import Action, ValidationStatus
 from mstrio.object_management.migration import PackageSettings, Migration
+from mstrio.distribution_services.email import send_email
+from mstrio.users_and_groups import User
 from mstrio.types import ObjectTypes
 from datetime import datetime
+from html import escape
 import re
 from time import sleep
 from mstrio.connection import Connection
@@ -74,6 +77,66 @@ def _build_object_insert_queries(object_properties, request_id):
         for item in object_properties
     ]
 
+
+def _normalize_email_recipients(raw_value):
+    if raw_value is None:
+        return []
+
+    raw_text = str(raw_value).strip()
+    if not raw_text or raw_text.lower() == "nan":
+        return []
+
+    recipients = []
+    for value in re.split(r"[;,]", raw_text):
+        normalized_value = value.strip()
+        if normalized_value:
+            recipients.append(normalized_value)
+
+    return recipients
+
+
+def _resolve_requestor_recipient_ids(connection, raw_recipients):
+    resolved_recipient_ids = []
+
+    for recipient in raw_recipients:
+        if re.fullmatch(r"[0-9A-Fa-f]{32}", recipient):
+            resolved_recipient_ids.append(recipient.upper())
+            continue
+
+        try:
+            resolved_user = User(connection, username=recipient)
+        except Exception:
+            try:
+                resolved_user = User(connection, id=recipient)
+            except Exception:
+                resolved_user = User(connection, name=recipient)
+
+        resolved_recipient_ids.append(resolved_user.id)
+
+    return resolved_recipient_ids
+
+
+def _get_requestor_recipients(request_row):
+    candidate_keys = [
+        "Requestor@ID",
+        "Requestor",
+        "Requestor ID",
+        "Requestor@NAME",
+    ]
+
+    for key in candidate_keys:
+        recipients = _normalize_email_recipients(request_row.get(key))
+        if recipients:
+            return recipients
+
+    for key in request_row.index:
+        if str(key).lower().startswith("requestor"):
+            recipients = _normalize_email_recipients(request_row.get(key))
+            if recipients:
+                return recipients
+
+    raise ValueError("No requestor user ID found in the request report.")
+
 print("Connecting to environment...")
 # define myConn variable to establish connection to Environment and be able to reuse it later in the script
 base_url = "https://env-371825.ma.cloud.microstrategy.com/MicroStrategyLibrary"
@@ -104,6 +167,10 @@ migration_content_path = str(df['Migration Obj@Content Path'][0])
 shortcut_path = _normalize_mstr_folder_path(project_name, migration_content_path)
 request_id = df['Request@ID'][0]
 target_project_name = str(df['Target Project@NAME'][0]).strip()
+requestor_recipients = _resolve_requestor_recipient_ids(
+    myConn,
+    _get_requestor_recipients(df.iloc[0]),
+)
 print(
     "Retrieved migration parameters:\n"
     f"  Request ID: {request_id}\n"
@@ -369,6 +436,57 @@ sql_query_update_validation_flag = (
 )
 print("SQL: updating validation flag")
 db_instance.execute_query(query=sql_query_update_validation_flag, project_id=project_id)
+
+email_subject = f"Migration package validation result for request {request_id}"
+validation_status_text = getattr(validation_result.status, 'name', str(validation_result.status))
+email_content = "\n".join(
+    [
+        "<html>",
+        '    <body style="font-family: Segoe UI, Arial, sans-serif; color: #1f2937;">',
+        '        <h2 style="margin-bottom: 12px;">Migration Package Validation Result</h2>',
+        f'        <p style="margin-bottom: 16px;">The package workflow has finished for request <strong>{escape(str(request_id))}</strong>.</p>',
+        '        <table style="border-collapse: collapse; min-width: 480px;">',
+        '            <tr>',
+        '                <td style="padding: 8px 12px; border: 1px solid #d1d5db; font-weight: 600;">Request ID</td>',
+        f'                <td style="padding: 8px 12px; border: 1px solid #d1d5db;">{escape(str(request_id))}</td>',
+        '            </tr>',
+        '            <tr>',
+        '                <td style="padding: 8px 12px; border: 1px solid #d1d5db; font-weight: 600;">Source project</td>',
+        f'                <td style="padding: 8px 12px; border: 1px solid #d1d5db;">{escape(str(project_name))}</td>',
+        '            </tr>',
+        '            <tr>',
+        '                <td style="padding: 8px 12px; border: 1px solid #d1d5db; font-weight: 600;">Target project</td>',
+        f'                <td style="padding: 8px 12px; border: 1px solid #d1d5db;">{escape(str(target_project_name))}</td>',
+        '            </tr>',
+        '            <tr>',
+        '                <td style="padding: 8px 12px; border: 1px solid #d1d5db; font-weight: 600;">Package name</td>',
+        f'                <td style="padding: 8px 12px; border: 1px solid #d1d5db;">{escape(str(package_name))}</td>',
+        '            </tr>',
+        '            <tr>',
+        '                <td style="padding: 8px 12px; border: 1px solid #d1d5db; font-weight: 600;">Validation status</td>',
+        f'                <td style="padding: 8px 12px; border: 1px solid #d1d5db;">{escape(str(validation_status_text))}</td>',
+        '            </tr>',
+        '            <tr>',
+        '                <td style="padding: 8px 12px; border: 1px solid #d1d5db; font-weight: 600;">Validation flag</td>',
+        f'                <td style="padding: 8px 12px; border: 1px solid #d1d5db;">{escape(str(validation_flag))}</td>',
+        '            </tr>',
+        '            <tr>',
+        '                <td style="padding: 8px 12px; border: 1px solid #d1d5db; font-weight: 600; vertical-align: top;">Details</td>',
+        f'                <td style="padding: 8px 12px; border: 1px solid #d1d5db;">{escape(str(validation_message))}</td>',
+        '            </tr>',
+        '        </table>',
+        '    </body>',
+        '</html>',
+    ]
+)
+print(f"Sending email notification to: {', '.join(requestor_recipients)}")
+send_email(
+    connection=myConn,
+    users=requestor_recipients,
+    subject=email_subject,
+    content=email_content,
+        is_html=True,
+)
 
 print("Create package proces completed for Request ID: ", df['Request@ID'][0])
 
