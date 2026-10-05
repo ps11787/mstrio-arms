@@ -1,5 +1,16 @@
 # Documentation for create_package.py
 
+## Änderungsprotokoll
+
+### Aktuelle Korrekturen
+
+- Das Erstellen eines Migration Packages bricht nicht mehr ab, wenn der vorhandene Migration-GUID-Wert leer oder bereits ungültig ist.
+- Ein bereits vorhandenes Migrationsobjekt wird nur noch bereinigt, wenn es wirklich geladen werden kann. Andernfalls wird ein neues Package ohne Löschvorgang angelegt.
+- Die Abhängigkeitsauflösung berücksichtigt jetzt rekursiv alle relevanten Objekttypen aus den Shortcut-Zielen, einschließlich Metriken, Datasets, Reports, Filter und Prompts.
+- Systemobjekte von MicroStrategy wie `>`, `*` und `DSS Built-in Package` werden beim Package-Aufbau herausgefiltert.
+
+---
+
 ## Purpose
 
 This script automates the creation of a MicroStrategy migration package for a specific request. It reads request metadata from a MicroStrategy report, resolves the target folder, collects related objects, creates a package, stores the package and object information in ARMS tables, triggers validation against the target project, and automatically retries the process when validation reports missing objects.
