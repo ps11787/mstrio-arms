@@ -134,6 +134,67 @@ def test_resolve_target_project_name_prefers_status_env_and_prefix_match():
     assert result == "T01 Microstrategy Tutorial"
 
 
+def test_resolve_target_project_name_ignores_misleading_source_name_when_prefix_matches():
+    class FakeDatasource:
+        def execute_query(self, **kwargs):
+            return {
+                "results": {
+                    "data": {
+                        "status_id": [5, 5],
+                        "tgt_env_id": ["ENV-TEST", "ENV-TEST"],
+                        "tgt_project_name": [
+                            "Consolidated Education Project",
+                            "T01 - Microstrategy Tutorial",
+                        ],
+                        "project_prefix": ["", "T01 -"],
+                        "source_env_name": ["dev", "dev"],
+                    }
+                }
+            }
+
+    result = _resolve_target_project_name_from_sql(
+        datasource=FakeDatasource(),
+        project_id="4B0544627D49F8DA03C26D817D208263",
+        target_env_id="ENV-TEST",
+        request_status_id=5,
+        source_project_name="Consolidated Education Project",
+        target_prefix="T01",
+        fallback_name="Consolidated Education Project",
+    )
+
+    assert result == "T01 - Microstrategy Tutorial"
+
+
+def test_resolve_target_project_name_prefers_exact_target_project_id():
+    class FakeDatasource:
+        def execute_query(self, **kwargs):
+            query = kwargs["query"]
+            if "CAST(tgt_project_id AS VARCHAR) = '11'" in query:
+                return {
+                    "results": {
+                        "data": {
+                            "tgt_project_id": [11],
+                            "tgt_project_name": ["T01 - Microstrategy Tutorial"],
+                            "status_id": [8],
+                        }
+                    }
+                }
+            return {"results": {"data": {}}}
+
+    result = _resolve_target_project_name_from_sql(
+        datasource=FakeDatasource(),
+        project_id="4B0544627D49F8DA03C26D817D208263",
+        target_env_id="ENV-TEST",
+        request_status_id=5,
+        source_project_name="Consolidated Education Project",
+        target_prefix="T01",
+        fallback_name="Consolidated Education Project",
+        target_project_id=11,
+    )
+
+    assert result == "T01 - Microstrategy Tutorial"
+
+
 def test_insert_migration_dim_record_uses_arms_project_key_not_guid():
     captured = {}
 
@@ -157,6 +218,7 @@ def test_insert_migration_dim_record_uses_arms_project_key_not_guid():
     )
 
     assert captured["project_id"] == "4B0544627D49F8DA03C26D817D208263"
+    assert "COALESCE(MAX(migration_id), 0) + 1" in captured["query"]
     assert "(SELECT migration_key_id FROM arms.t_mig_dim_request WHERE request_id = 11)" in captured["query"]
     assert "CURRENT_TIMESTAMP, 42, 13" in captured["query"]
     assert "4B0544627D49F8DA03C26D817D208263" not in captured["query"]

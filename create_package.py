@@ -5,7 +5,7 @@ from mstrio.project_objects.report import Report
 from mstrio.object_management.folder import Folder, get_folder_id_from_path, list_folders
 from mstrio.object_management.migration.package import Action, ValidationStatus
 from mstrio.object_management.migration import PackageSettings, Migration
-from mstrio.types import ObjectTypes
+from mstrio.types import ObjectSubTypes, ObjectTypes
 from datetime import datetime
 import re
 from time import sleep
@@ -57,12 +57,35 @@ def _format_dt_userfriendly(value):
 def _normalize_object_type_name(value):
     if value is None:
         return ""
-    text = str(value).split(".")[-1] if "." in str(value) else str(value)
+
+    if isinstance(value, str):
+        text = value
+    elif hasattr(value, "name"):
+        text = value.name
+    else:
+        text = str(value)
+        for enum_type in (ObjectTypes, ObjectSubTypes):
+            try:
+                if enum_type.contains(value):
+                    text = enum_type(value).name
+                    break
+            except Exception:
+                pass
+
+    text = text.split(".")[-1] if "." in str(text) else str(text)
     return re.sub(r"[^a-z0-9]+", "_", text.lower()).strip("_")
 
 
+def _canonical_object_type_name(value):
+    normalized = _normalize_object_type_name(value)
+    aliases = {
+        "metric_agg": "agg_metric",
+    }
+    return aliases.get(normalized, normalized)
+
+
 def _is_schema_object_type(obj_type):
-    normalized = _normalize_object_type_name(obj_type)
+    normalized = _canonical_object_type_name(obj_type)
     return normalized in {"schema", "schema_definition", "project_schema"}
 
 
@@ -70,6 +93,7 @@ def _required_dependency_types():
     return {
         "metric",
         "agg_metric",
+        "metric_agg",
         "metric_dmx",
         "metric_training",
         "dataset",
@@ -109,8 +133,26 @@ def _required_dependency_types():
 
 
 def _is_required_dependency_type(obj_type):
-    normalized = _normalize_object_type_name(obj_type)
+    normalized = _canonical_object_type_name(obj_type)
     return normalized in _required_dependency_types()
+
+
+_BUILTIN_METRIC_FUNCTION_NAMES = {
+    "aggregation",
+    "average",
+    "count",
+    "geometric mean",
+    "maximum",
+    "median",
+    "minimum",
+    "mode",
+    "product",
+    "standard deviation",
+    "sum of wya",
+    "total",
+    "variance",
+    "weighted yearly average",
+}
 
 
 def _is_builtin_system_dependency(dep):
@@ -118,10 +160,14 @@ def _is_builtin_system_dependency(dep):
         return True
 
     dep_name = str(dep.get("name") or "").strip()
-    dep_type = str(dep.get("type") or "").strip()
+    dep_type_raw = dep.get("type")
+    dep_type = str(dep_type_raw or "").strip()
     dep_id = str(dep.get("id") or "").strip()
     if not dep_id or not dep_type:
         return True
+
+    normalized_dep_name = re.sub(r"[^a-z0-9]+", " ", dep_name.lower()).strip()
+    normalized_dep_type = _canonical_object_type_name(dep_type_raw)
 
     if dep_name in {"*", ">", "DSS Built-in Package"}:
         return True
@@ -129,8 +175,139 @@ def _is_builtin_system_dependency(dep):
         return True
     if dep_name and dep_type.lower() in {"folder", "package", "project"} and set(dep_name) <= {"*", ">"}:
         return True
+    if (
+        normalized_dep_type in {"metric", "agg_metric", "metric_agg", "metric_dmx", "metric_training", "function"}
+        and normalized_dep_name in _BUILTIN_METRIC_FUNCTION_NAMES
+    ):
+        return True
 
     return False
+
+
+def _canonical_object_id(value):
+    if value is None:
+        return ""
+    return str(value).strip().upper()
+
+
+def _is_allowed_dependency_entry(dep):
+    if dep is None or _is_builtin_system_dependency(dep):
+        return False
+
+    dep_id = dep.get("id")
+    dep_type = dep.get("type")
+    if not dep_id or not dep_type:
+        return False
+    if not _is_required_dependency_type(dep_type):
+        return False
+    return True
+
+
+def _is_shortcut_root_entry(dep):
+    if dep is None or _is_builtin_system_dependency(dep) or _is_schema_object_type(dep.get("type")):
+        return False
+
+    dep_id = dep.get("id")
+    dep_type = dep.get("type")
+    return bool(dep_id and dep_type)
+
+
+def _resolve_target_object(obj, connection=None):
+    if obj is None:
+        return None
+
+    target_info = getattr(obj, "target_info", None)
+    if not isinstance(target_info, dict):
+        return obj
+
+    target_id = (
+        target_info.get("id")
+        or target_info.get("object_id")
+        or target_info.get("objectId")
+    )
+    target_type = target_info.get("type")
+    if not target_id or not target_type or connection is None:
+        return obj
+
+    try:
+        return Object(connection=connection, id=target_id, type=target_type)
+    except Exception:
+        return obj
+
+
+def _resolve_shortcut_root_object(obj, connection=None):
+    target_obj = _resolve_target_object(obj, connection)
+    if target_obj is None:
+        return None
+
+    if _canonical_object_type_name(getattr(target_obj, "type", None)) != "shortcut_type":
+        return target_obj
+
+    if connection is None:
+        return None
+
+    try:
+        dependencies = obj.list_dependencies() or []
+    except Exception:
+        return None
+
+    for dependency in dependencies:
+        if not _is_allowed_dependency_entry(dependency):
+            continue
+
+        dep_id = _canonical_object_id(dependency.get("id"))
+        dep_type = dependency.get("type")
+        if not dep_id or not dep_type:
+            continue
+
+        try:
+            return Object(connection=connection, id=dep_id, type=dep_type)
+        except Exception:
+            continue
+
+    return None
+
+
+def _resolve_shortcut_target_entry(obj, connection=None):
+    if obj is None:
+        return None, None
+
+    target_info = getattr(obj, "target_info", None)
+    if isinstance(target_info, dict):
+        target_id = target_info.get("id") or target_info.get("object_id") or target_info.get("objectId")
+        target_type = target_info.get("type")
+        if target_id and target_type:
+            target_obj = None
+            if connection is not None:
+                try:
+                    target_obj = Object(connection=connection, id=target_id, type=target_type)
+                except Exception:
+                    target_obj = None
+            return target_info, target_obj
+
+    try:
+        dependencies = obj.list_dependencies() or []
+    except Exception:
+        return None, None
+
+    for dependency in dependencies:
+        if not _is_allowed_dependency_entry(dependency):
+            continue
+
+        dep_id = _canonical_object_id(dependency.get("id"))
+        dep_type = dependency.get("type")
+        if not dep_id or not dep_type:
+            continue
+
+        dep_obj = None
+        if connection is not None:
+            try:
+                dep_obj = Object(connection=connection, id=dep_id, type=dep_type)
+            except Exception:
+                dep_obj = None
+        return dependency, dep_obj
+
+    return None, None
 
 
 def _collect_package_dependencies(shortcut_objects, connection=None):
@@ -138,12 +315,12 @@ def _collect_package_dependencies(shortcut_objects, connection=None):
     seen_ids = set()
 
     def add_dependency(dep, *, include_if_required=True):
-        if _is_builtin_system_dependency(dep):
+        if not _is_allowed_dependency_entry(dep):
             return
 
-        dep_id = dep.get("id")
+        dep_id = _canonical_object_id(dep.get("id"))
         dep_type = dep.get("type")
-        if not dep_id or dep_id in seen_ids:
+        if dep_id in seen_ids:
             return
         if include_if_required and not _is_required_dependency_type(dep_type):
             return
@@ -172,9 +349,16 @@ def _collect_package_dependencies(shortcut_objects, connection=None):
         collected.append(item)
         seen_ids.add(dep_id)
 
-    def walk_object_dependencies(target_obj):
+    def walk_object_dependencies(target_obj, visited=None):
         if target_obj is None:
             return
+
+        target_id = _canonical_object_id(getattr(target_obj, "id", None))
+        if target_id:
+            visited = set() if visited is None else visited
+            if target_id in visited:
+                return
+            visited.add(target_id)
 
         try:
             dependencies = target_obj.list_dependencies() or []
@@ -182,10 +366,10 @@ def _collect_package_dependencies(shortcut_objects, connection=None):
             return
 
         for dependency in dependencies:
-            if _is_builtin_system_dependency(dependency):
+            if not _is_allowed_dependency_entry(dependency):
                 continue
 
-            dep_id = dependency.get("id")
+            dep_id = _canonical_object_id(dependency.get("id"))
             dep_type = dependency.get("type")
             if not dep_id:
                 continue
@@ -197,20 +381,32 @@ def _collect_package_dependencies(shortcut_objects, connection=None):
                 except Exception:
                     dep_obj = None
 
-            if dep_type is not None and _is_required_dependency_type(dep_type):
-                add_dependency(dependency, include_if_required=True)
-            elif dep_obj is not None:
-                walk_object_dependencies(dep_obj)
-
+            add_dependency({**dependency, "id": dep_id}, include_if_required=True)
             if dep_obj is not None:
-                walk_object_dependencies(dep_obj)
+                walk_object_dependencies(dep_obj, visited)
 
     for shortcut in shortcut_objects or []:
-        for dependency in shortcut.list_dependencies() or []:
-            if _is_builtin_system_dependency(dependency):
+        target_obj = _resolve_target_object(shortcut, connection)
+        if target_obj is not None:
+            dep_entry = {
+                "id": getattr(target_obj, "id", getattr(shortcut, "id", None)),
+                "type": getattr(target_obj, "type", getattr(shortcut, "type", None)),
+                "name": getattr(target_obj, "name", getattr(shortcut, "name", None)),
+            }
+            if _is_allowed_dependency_entry(dep_entry):
+                add_dependency(dep_entry, include_if_required=True)
+
+        dependencies = []
+        try:
+            dependencies = (target_obj or shortcut).list_dependencies() or []
+        except Exception:
+            dependencies = []
+
+        for dependency in dependencies:
+            if not _is_allowed_dependency_entry(dependency):
                 continue
 
-            dep_id = dependency.get("id")
+            dep_id = _canonical_object_id(dependency.get("id"))
             dep_type = dependency.get("type")
             if not dep_id:
                 continue
@@ -222,13 +418,9 @@ def _collect_package_dependencies(shortcut_objects, connection=None):
                 except Exception:
                     dep_obj = None
 
-            if dep_type is not None and _is_required_dependency_type(dep_type):
-                add_dependency(dependency, include_if_required=True)
-            elif dep_obj is not None:
-                walk_object_dependencies(dep_obj)
-
+            add_dependency({**dependency, "id": dep_id}, include_if_required=True)
             if dep_obj is not None:
-                walk_object_dependencies(dep_obj)
+                walk_object_dependencies(dep_obj, set())
 
     return collected
 
@@ -285,9 +477,19 @@ def _parse_missing_object_legacy(validation_message):
     }
 
 
+def _sql_literal(value):
+    if value is None:
+        return "''"
+    return str(value).replace("'", "''")
+
+
+def _db_object_type_name(value):
+    return _canonical_object_type_name(value)
+
+
 def _build_object_insert_queries(object_properties, request_id):
     return [
-        f"INSERT INTO arms.t_mig_dim_objects(id,type,name,location,date_created,date_modified,keyid,migration_key_id) VALUES ('{item['id']}','{item['type']}','{item['name']}','{item['location']}', '{item['date_created']}','{item['date_modified']}', (select max(keyid) +1 from arms.t_mig_dim_objects),(select migration_key_id from arms.t_mig_dim_request where request_id={request_id}));"
+        f"INSERT INTO arms.t_mig_dim_objects(id,type,name,location,date_created,date_modified,keyid,migration_key_id) VALUES ('{_sql_literal(item['id'])}','{_sql_literal(_db_object_type_name(item['type']))}','{_sql_literal(item['name'])}','{_sql_literal(item['location'])}', '{_sql_literal(item['date_created'])}','{_sql_literal(item['date_modified'])}', (select max(keyid) +1 from arms.t_mig_dim_objects),(select migration_key_id from arms.t_mig_dim_request where request_id={request_id}));"
         for item in object_properties
     ]
 
@@ -333,11 +535,11 @@ def main() -> int:
         PackageSettings.AclOnReplacingObjects.USE_EXISTING,
         PackageSettings.AclOnNewObjects.INHERIT_ACL_AS_DEST_FOLDER,
     )
-    project_name = str(df['Project@Name'][0]).strip()
-    migration_content_path = str(df['Migration Obj@Content Path'][0])
+    project_name = str(df['Project@Name'].iloc[0]).strip()
+    migration_content_path = str(df['Migration Obj@Content Path'].iloc[0])
     shortcut_path = _normalize_mstr_folder_path(project_name, migration_content_path)
-    request_id = df['Request@ID'][0]
-    target_project_name = str(df['Target Project@NAME'][0]).strip()
+    request_id = df['Request@ID'].iloc[0]
+    target_project_name = str(df['Target Project@NAME'].iloc[0]).strip()
     print(
         "Retrieved migration parameters:\n"
         f"  Request ID: {request_id}\n"
@@ -352,41 +554,63 @@ def main() -> int:
     seen_object_ids = set()
 
     for obj in shortcuts4Migration:
-        dependencies = obj.list_dependencies() or []
+        target_entry, target_obj = _resolve_shortcut_target_entry(obj, myConn)
+        root_obj = target_obj or _resolve_shortcut_root_object(obj, myConn)
+        if root_obj is None:
+            print(f"Skipping shortcut '{getattr(obj, 'name', obj.id)}': no target object found.")
+            continue
+
+        obj_id = _canonical_object_id((target_entry or {}).get("id") or getattr(root_obj, "id", None))
+        obj_type = (target_entry or {}).get("type") or getattr(root_obj, "type", None)
+        obj_name = (target_entry or {}).get("name") or getattr(root_obj, "name", getattr(obj, "name", None))
+        obj_date_modified = (target_entry or {}).get("date_modified") or getattr(root_obj, "date_modified", getattr(obj, "date_modified", None))
+        if _is_shortcut_root_entry({"id": obj_id, "type": obj_type, "name": obj_name}) and obj_id not in seen_object_ids:
+            objects4Migration.append({"id": obj_id, "type": obj_type, "name": obj_name, "date_modified": obj_date_modified})
+            objects4Migration_properties.append({
+                "id": obj_id,
+                "type": obj_type,
+                "name": obj_name,
+                "location": getattr(root_obj, "location", None),
+                "date_created": getattr(root_obj, "date_created", None),
+                "date_modified": obj_date_modified,
+            })
+            seen_object_ids.add(obj_id)
+
+        dependencies = []
+        try:
+            dependencies = root_obj.list_dependencies() or []
+        except Exception:
+            dependencies = []
         if not dependencies:
-            print(f"Skipping shortcut '{obj.name}' ({obj.id}): no target dependency found.")
+            print(f"Skipping shortcut '{getattr(root_obj, 'name', obj_id)}' ({obj_id}): no target dependency found.")
             continue
 
         for dependency in dependencies:
-            dep_id = dependency.get("id")
+            if not _is_allowed_dependency_entry(dependency):
+                continue
+
+            dep_id = _canonical_object_id(dependency.get("id"))
             dep_type = dependency.get("type")
             if not dep_id or dep_id in seen_object_ids:
                 continue
 
-            if dep_type is not None and _is_required_dependency_type(dep_type):
-                dep_obj = Object(connection=myConn, id=dep_id, type=dep_type)
-                objects4Migration.append({"id": dep_id, "type": dep_type, "name": dependency.get("name") or dep_obj.name, "date_modified": getattr(dep_obj, "date_modified", dependency.get("date_modified"))})
-                objects4Migration_properties.append({"id": dep_obj.id, "type": dep_obj.type, "name": dep_obj.name, "location": getattr(dep_obj, "location", None), "date_created": getattr(dep_obj, "date_created", None), "date_modified": dep_obj.date_modified})
-                seen_object_ids.add(dep_id)
-                continue
-
-            target = dependency
-            obj_info = Object(connection=myConn, id=target['id'], type=target['type'])
-            objects4Migration.append({"id": target['id'], "type": target['type'], "name": target.get('name') or obj_info.name, "date_modified": target.get('date_modified') or obj_info.date_modified})
-            objects4Migration_properties.append({"id": obj_info.id, "type": obj_info.type, "name": obj_info.name, "location": obj_info.location, "date_created": obj_info.date_created, "date_modified": obj_info.date_modified})
-            seen_object_ids.add(target['id'])
+            dep_obj = Object(connection=myConn, id=dep_id, type=dep_type)
+            objects4Migration.append({"id": dep_id, "type": dep_type, "name": dependency.get("name") or dep_obj.name, "date_modified": getattr(dep_obj, "date_modified", dependency.get("date_modified"))})
+            objects4Migration_properties.append({"id": dep_obj.id, "type": dep_obj.type, "name": dep_obj.name, "location": getattr(dep_obj, "location", None), "date_created": getattr(dep_obj, "date_created", None), "date_modified": dep_obj.date_modified})
+            seen_object_ids.add(dep_id)
 
             try:
-                target_dependencies = obj_info.list_dependencies() or []
+                target_dependencies = dep_obj.list_dependencies() or []
             except Exception:
                 target_dependencies = []
 
             for target_dependency in target_dependencies:
-                added_dep_id = target_dependency.get("id")
+                if not _is_allowed_dependency_entry(target_dependency):
+                    continue
+
+                added_dep_id = _canonical_object_id(target_dependency.get("id"))
                 added_dep_type = target_dependency.get("type")
                 if not added_dep_id or added_dep_id in seen_object_ids:
-                    continue
-                if not _is_required_dependency_type(added_dep_type):
                     continue
 
                 added_dep_obj = Object(connection=myConn, id=added_dep_id, type=added_dep_type)
@@ -396,7 +620,7 @@ def main() -> int:
 
     extra_dependencies = _collect_package_dependencies(shortcuts4Migration, connection=myConn)
     for dependency in extra_dependencies:
-        dep_id = dependency["id"]
+        dep_id = _canonical_object_id(dependency["id"])
         if dep_id in seen_object_ids:
             continue
         objects4Migration.append({"id": dep_id, "type": dependency["type"], "name": dependency.get("name"), "date_modified": dependency.get("date_modified")})
@@ -412,6 +636,12 @@ def main() -> int:
 
     print(objects4Migration_properties)
 
+    if not objects4Migration:
+        raise ValueError(
+            "No valid migration package content was found after dependency resolution. "
+            "The shortcut folder produced no allowed dependency objects (metrics, datasets, reports, filters, prompts, cubes)."
+        )
+
     myPackageConfig = Migration.build_package_config(
         connection=myConn,
         content=objects4Migration,
@@ -419,24 +649,24 @@ def main() -> int:
     )
 
     print("check for existing migrations..")
-    migration_guid = str(df['Migration Obj@GUID'][0]).strip() if 'Migration Obj@GUID' in df.columns else ""
+    migration_guid = str(df['Migration Obj@GUID'].iloc[0]).strip() if 'Migration Obj@GUID' in df.columns else ""
     _delete_existing_migration_if_present(myConn, migration_guid, force=True)
 
     timestamp = datetime.now().strftime('%Y%m%d%H%M%S')
-    package_name = f"Req_{df['Request@ID'][0]}_{df['Migration Obj@Name'][0]}_{timestamp}"
-    Migration.create_object_migration(myConn, toc_view=myPackageConfig, name=package_name, project_name=df['Project@Name'][0])
+    package_name = f"Req_{df['Request@ID'].iloc[0]}_{df['Migration Obj@Name'].iloc[0]}_{timestamp}"
+    Migration.create_object_migration(myConn, toc_view=myPackageConfig, name=package_name, project_name=df['Project@Name'].iloc[0])
 
     print("SQL: clearing existing migration objects")
-    db_instance.execute_query(query=f"delete from arms.t_mig_dim_objects where migration_key_id=(select migration_key_id from arms.t_mig_dim_request where request_id={df['Request@ID'][0]});", project_id=PROJECT_ID)
+    db_instance.execute_query(query=f"delete from arms.t_mig_dim_objects where migration_key_id=(select migration_key_id from arms.t_mig_dim_request where request_id={df['Request@ID'].iloc[0]});", project_id=PROJECT_ID)
     sql_queries_insert_objects = _build_object_insert_queries(objects4Migration_properties, request_id)
     print("SQL: inserting migration objects")
     db_instance.execute_query(query="\n".join(sql_queries_insert_objects), project_id=PROJECT_ID)
 
     current_migration = Migration(myConn, name=package_name)
     migration_id = current_migration.id
-    sql_query_insert_comment = f"INSERT INTO arms.t_mig_comments(comment_id,request_id,comment_text,comment_time,comment_author,human_flag) VALUES ((select max (comment_id) + 1 from arms.t_mig_comments),{df['Request@ID'][0]},'Package Created with mstrio',current_timestamp,'system',0);"
-    sql_query_upd_req_table = f"update arms.t_mig_dim_request set status_id=2 where request_id={df['Request@ID'][0]};"
-    sql_query_insert_migration = f"Update arms.t_mig_lu_migration_obj set migration_obj_id='{migration_id}',migration_obj_cre_time=current_timestamp WHERE migration_key_id=(select migration_key_id from arms.t_mig_dim_request where request_id={df['Request@ID'][0]});"
+    sql_query_insert_comment = f"INSERT INTO arms.t_mig_comments(comment_id,request_id,comment_text,comment_time,comment_author,human_flag) VALUES ((select max (comment_id) + 1 from arms.t_mig_comments),{df['Request@ID'].iloc[0]},'Package Created with mstrio',current_timestamp,'system',0);"
+    sql_query_upd_req_table = f"update arms.t_mig_dim_request set status_id=2 where request_id={df['Request@ID'].iloc[0]};"
+    sql_query_insert_migration = f"Update arms.t_mig_lu_migration_obj set migration_obj_id='{migration_id}',migration_obj_cre_time=current_timestamp WHERE migration_key_id=(select migration_key_id from arms.t_mig_dim_request where request_id={df['Request@ID'].iloc[0]});"
     print("SQL: recording package creation comment")
     db_instance.execute_query(query=sql_query_insert_comment, project_id=PROJECT_ID)
     print("SQL: updating migration package ID")
@@ -498,8 +728,8 @@ def main() -> int:
             validation_retry_count += 1
             myPackageConfig = Migration.build_package_config(connection=myConn, content=objects4Migration, package_settings=myPackageSettings)
             current_migration.delete(force=True)
-            package_name = f"Req_{request_id}_{df['Migration Obj@Name'][0]}_{datetime.now().strftime('%Y%m%d%H%M%S')}_retry{validation_retry_count}"
-            Migration.create_object_migration(myConn, toc_view=myPackageConfig, name=package_name, project_name=df['Project@Name'][0])
+            package_name = f"Req_{request_id}_{df['Migration Obj@Name'].iloc[0]}_{datetime.now().strftime('%Y%m%d%H%M%S')}_retry{validation_retry_count}"
+            Migration.create_object_migration(myConn, toc_view=myPackageConfig, name=package_name, project_name=df['Project@Name'].iloc[0])
             current_migration = Migration(myConn, name=package_name)
             migration_id = current_migration.id
             print("SQL: clearing migration objects after retry")
@@ -511,7 +741,7 @@ def main() -> int:
             print("SQL: updating migration package ID after retry")
             db_instance.execute_query(query=sql_query_insert_migration, project_id=PROJECT_ID)
 
-    print("Create package proces completed for Request ID: ", df['Request@ID'][0])
+    print("Create package proces completed for Request ID: ", df['Request@ID'].iloc[0])
     return 0
 
 
