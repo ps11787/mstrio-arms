@@ -10,6 +10,7 @@ import os
 from datetime import datetime
 from time import sleep
 
+import mstrio.api.migration as migration_api
 from mstrio.connection import Connection
 from mstrio.datasources.datasource_instance import DatasourceInstance
 from mstrio.object_management.migration import Migration
@@ -53,6 +54,26 @@ REQUEST_STATUS_FILTER = tuple(
     if item.strip()
 )
 FORCE_UNLOCK_LOCKED_PACKAGE = os.getenv("MSTR_FORCE_UNLOCK_LOCKED_PACKAGE", "true").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "y",
+}
+POST_IMPORT_POLL_SECONDS = int(os.getenv("MSTR_POST_IMPORT_POLL_SECONDS", "5"))
+POST_IMPORT_TIMEOUT_SECONDS = int(os.getenv("MSTR_POST_IMPORT_TIMEOUT_SECONDS", "600"))
+REQUIRE_UNLOCKED_PACKAGE_AFTER_IMPORT = os.getenv(
+    "MSTR_REQUIRE_UNLOCKED_PACKAGE_AFTER_IMPORT",
+    "false",
+).strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "y",
+}
+REQUIRE_UNDO_REQUESTED_AFTER_IMPORT = os.getenv(
+    "MSTR_REQUIRE_UNDO_REQUESTED_AFTER_IMPORT",
+    "true",
+).strip().lower() in {
     "1",
     "true",
     "yes",
@@ -730,6 +751,36 @@ def _resolve_arms_project_id(
     return None
 
 
+def _resolve_target_arms_project_id(
+    request_row: dict[str, object],
+    datasource: DatasourceInstance,
+    query_project_id: str,
+    target_project_name: str,
+) -> int | None:
+    """Resolve the numeric ARMS target project key for migration inserts.
+
+    Priority:
+    1) Use request-level `tgt_project_id`/`target_project_id` when present.
+    2) Fall back to target project name lookup in `arms.t_mig_lu_project`.
+    """
+    direct_target_project_id = _get_first_value_from_result_data(
+        request_row,
+        "tgt_project_id",
+        "target_project_id",
+    )
+    if direct_target_project_id is not None:
+        try:
+            return _coerce_int(direct_target_project_id)
+        except (TypeError, ValueError):
+            pass
+
+    return _resolve_arms_project_id(
+        datasource,
+        query_project_id,
+        project_name=target_project_name,
+    )
+
+
 def _insert_migration_dim_record(
     datasource: DatasourceInstance,
     project_id: str,
@@ -921,6 +972,148 @@ def _wait_for_package_unlock(
         sleep(poll_seconds)
 
 
+def _is_undo_package_ready(migration: Migration) -> bool:
+    import_info = getattr(migration, "import_info", None)
+    undo_storage = getattr(import_info, "undo_storage", None)
+    undo_path = getattr(undo_storage, "path", None)
+    return bool(str(undo_path or "").strip())
+
+
+def _wait_for_post_import_readiness(
+    migration: Migration,
+    poll_seconds: int = POST_IMPORT_POLL_SECONDS,
+    timeout_seconds: int = POST_IMPORT_TIMEOUT_SECONDS,
+    require_unlocked_package: bool = REQUIRE_UNLOCKED_PACKAGE_AFTER_IMPORT,
+) -> None:
+    """Wait until import is complete and undo package exists.
+
+    Some environments keep the migration package in LOCKED status even after
+    successful import and undo package creation. In strict mode
+    (`require_unlocked_package=True`), the workflow still waits for unlock.
+    """
+    deadline_epoch = datetime.now().timestamp() + timeout_seconds
+    last_snapshot = None
+
+    while True:
+        try:
+            migration.fetch()
+        except Exception:
+            pass
+
+        import_info = getattr(migration, "import_info", None)
+        package_info = getattr(migration, "package_info", None)
+
+        import_status = getattr(import_info, "status", None)
+        import_status_name = getattr(import_status, "name", str(import_status))
+        package_status = getattr(package_info, "status", None)
+        package_status_name = getattr(package_status, "name", str(package_status or "unknown"))
+        undo_request_status = getattr(import_info, "undo_request_status", None)
+        undo_request_name = getattr(undo_request_status, "name", str(undo_request_status or "unknown"))
+        undo_ready = _is_undo_package_ready(migration)
+
+        snapshot = (
+            str(import_status_name),
+            str(package_status_name),
+            str(undo_request_name),
+            bool(undo_ready),
+        )
+        if snapshot != last_snapshot:
+            print(
+                "Post-import status: "
+                f"import={import_status_name}, package={package_status_name}, "
+                f"undo_request={undo_request_name}, undo_package_ready={undo_ready}"
+            )
+            last_snapshot = snapshot
+
+        if import_status in (ImportStatus.IMPORT_FAILED, ImportStatus.UNDO_FAILED):
+            raise RuntimeError(
+                "Migration ended in a failed terminal state during post-import checks: "
+                f"{import_status_name}."
+            )
+
+        import_completed = import_status in (ImportStatus.IMPORTED, ImportStatus.UNDO_SUCCESS)
+        package_unlocked = package_status is None or str(package_status_name).lower() != "locked"
+
+        if import_completed and undo_ready:
+            if package_unlocked:
+                print("Post-import checks passed: undo package is available and migration package is unlocked.")
+                return
+            if not require_unlocked_package:
+                print(
+                    "Post-import checks passed: import completed and undo package is available. "
+                    "Package remains locked due to server lifecycle behavior."
+                )
+                return
+
+        if datetime.now().timestamp() >= deadline_epoch:
+            if require_unlocked_package:
+                raise TimeoutError(
+                    "Post-import checks timed out before migration became reusable. "
+                    f"Last state: import={import_status_name}, package={package_status_name}, "
+                    f"undo_request={undo_request_name}, undo_package_ready={undo_ready}."
+                )
+            raise TimeoutError(
+                "Post-import checks timed out before import reached ready state. "
+                f"Last state: import={import_status_name}, package={package_status_name}, "
+                f"undo_request={undo_request_name}, undo_package_ready={undo_ready}."
+            )
+
+        sleep(poll_seconds)
+
+
+def _ensure_undo_request_not_pending(
+    migration: Migration,
+    target_connection: Connection,
+    require_requested: bool = REQUIRE_UNDO_REQUESTED_AFTER_IMPORT,
+) -> None:
+    """Move undoRequestStatus from PENDING to REQUESTED after successful import.
+
+    This does not execute undo. It only advances the request lifecycle so the
+    migration does not remain in a permanently pending undo-request state.
+    """
+    import_info = getattr(migration, "import_info", None)
+    undo_request_status = getattr(import_info, "undo_request_status", None)
+    undo_request_name = str(getattr(undo_request_status, "name", undo_request_status or "unknown")).upper()
+
+    if undo_request_name != "PENDING":
+        print(f"Undo request status already '{undo_request_name}', no normalization needed.")
+        return
+
+    migration_id = str(getattr(migration, "id", "")).strip()
+    if not migration_id:
+        message = "Cannot normalize undo request status: migration ID is missing."
+        if require_requested:
+            raise ValueError(message)
+        print(message)
+        return
+
+    try:
+        migration_api.update_migration(
+            connection=target_connection,
+            migration_id=migration_id,
+            body={"importInfo": {"undoRequestStatus": "requested"}},
+            prefer="respond-async",
+            project_id=getattr(target_connection, "project_id", None),
+        )
+        migration.fetch()
+    except Exception as exc:
+        message = f"Unable to normalize undo request status for migration '{migration_id}': {exc}"
+        if require_requested:
+            raise RuntimeError(message) from exc
+        print(message)
+        return
+
+    refreshed_status = getattr(getattr(migration, "import_info", None), "undo_request_status", None)
+    refreshed_name = str(getattr(refreshed_status, "name", refreshed_status or "unknown")).upper()
+    print(f"Undo request status after normalization: {refreshed_name}")
+
+    if require_requested and refreshed_name == "PENDING":
+        raise RuntimeError(
+            "Undo request status is still PENDING after normalization attempt. "
+            f"Migration ID: {migration_id}."
+        )
+
+
 def _list_active_migration_jobs(
     connection: Connection,
     migration_obj_guid: str,
@@ -990,13 +1183,88 @@ def _migrate_with_lock_retry(
     set, we log the condition but still do not destructively clear the object because the object
     ID may be unavailable or the migration may not yet exist in the target environment.
     """
+
+    def _start_migration_without_rebinding(existing_migration: Migration):
+        """Start import by changing request statuses only.
+
+        Some server states reject `migrate()` when it tries to rebind environment/project on
+        an existing migration. This path leaves binding untouched and only advances
+        import request status to trigger migration.
+        """
+        migration_id = str(getattr(existing_migration, "id", "")).strip()
+        if not migration_id:
+            raise ValueError("Migration object has no valid ID.")
+
+        source_conn = existing_migration.connection
+
+        migration_api.update_migration(
+            connection=source_conn,
+            migration_id=migration_id,
+            body={"importInfo": {"importRequestStatus": "requested"}},
+        )
+        migration_api.update_migration(
+            connection=source_conn,
+            migration_id=migration_id,
+            body={"importInfo": {"importRequestStatus": "approved"}},
+        )
+
+        fetched_body = migration_api.get_migration(
+            connection=source_conn,
+            migration_id=migration_id,
+            show_content="all",
+        ).json()
+        fetched_body["packageInfo"]["replicated"] = True
+
+        return migration_api.start_migration(
+            connection=target_env,
+            migration_id=migration_id,
+            prefer="respond-async",
+            generate_undo=generate_undo,
+            body=fetched_body,
+            project_id=getattr(target_env, "project_id", None),
+        )
+
+    def _clone_migration_for_reimport(existing_migration: Migration) -> Migration:
+        """Create a new migration object from the same package for re-import."""
+        source_conn = existing_migration.connection
+        package_id = str(getattr(existing_migration.package_info, "id", "")).strip()
+        if not package_id:
+            raise ValueError("Migration package ID is missing; cannot clone migration.")
+
+        base_url = str(getattr(target_env, "base_url", "") or "").strip()
+        target_env_id = base_url if base_url.endswith("/") else f"{base_url}/"
+
+        create_body = {
+            "importInfo": {
+                "environment": {"id": target_env_id, "name": target_env_id},
+                "project": {
+                    "id": getattr(target_env, "project_id", None),
+                    "name": target_project_name,
+                },
+            }
+        }
+
+        response = migration_api.create_new_migration(
+            connection=source_conn,
+            package_id=package_id,
+            body=create_body,
+            unlock_on_start=True,
+        )
+        cloned_id = (response.json() or {}).get("id")
+        if not cloned_id:
+            raise RuntimeError("Failed to clone migration from existing package.")
+
+        print(f"Created replacement migration for re-import: {cloned_id}")
+        return Migration(source_conn, id=cloned_id)
+
     for attempt in range(1, max_attempts + 1):
         try:
-            return migration.migrate(
+            result = migration.migrate(
                 target_env=target_env,
                 target_project_name=target_project_name,
                 generate_undo=generate_undo,
             )
+            return result, migration
         except Exception as exc:  # pragma: no cover - lock path is exercised in tests
             if not _is_package_locked_error(exc):
                 raise
@@ -1010,9 +1278,37 @@ def _migrate_with_lock_retry(
 
             print(
                 f"Package '{getattr(migration, 'name', getattr(migration, 'id', 'unknown'))}' is locked; "
-                "going directly to the failed scenario without waiting for unlock."
+                "retrying with status-only import start without rebinding target metadata."
             )
-            raise
+
+            has_runtime_metadata = bool(str(getattr(migration, "id", "")).strip()) and hasattr(
+                migration, "connection"
+            )
+            if not has_runtime_metadata:
+                raise
+
+            try:
+                start_response = _start_migration_without_rebinding(migration)
+                print(
+                    "Locked-package fallback started import successfully "
+                    f"for migration '{getattr(migration, 'id', 'unknown')}'."
+                )
+                return start_response, migration
+            except Exception as start_exc:
+                if "Import status must be 'pending'" not in str(start_exc):
+                    raise
+
+                print(
+                    "Existing migration import status is not pending; cloning migration from package "
+                    "and retrying import on the cloned object."
+                )
+                cloned_migration = _clone_migration_for_reimport(migration)
+                start_response = _start_migration_without_rebinding(cloned_migration)
+                print(
+                    "Cloned-migration fallback started import successfully "
+                    f"for migration '{getattr(cloned_migration, 'id', 'unknown')}'."
+                )
+                return start_response, cloned_migration
 
     raise RuntimeError("Migration retry loop exited without executing the package import.")
 
@@ -1200,7 +1496,7 @@ def main() -> int:
                 f"Starting migration at {migration_start_time.strftime('%Y-%m-%d %H:%M:%S')} "
                 f"with undo generation enabled."
             )
-            import_result = _migrate_with_lock_retry(
+            import_result, active_migration = _migrate_with_lock_retry(
                 current_migration,
                 target_env=target_env,
                 target_project_name=target_project_name,
@@ -1208,8 +1504,19 @@ def main() -> int:
                 poll_seconds=5,
                 max_attempts=1,
             )
-            import_status = _wait_for_migration_completion(current_migration)
+            import_status = _wait_for_migration_completion(active_migration)
             print(f"Migration import status final value: {getattr(import_status, 'name', str(import_status))}")
+            _wait_for_post_import_readiness(
+                active_migration,
+                poll_seconds=POST_IMPORT_POLL_SECONDS,
+                timeout_seconds=POST_IMPORT_TIMEOUT_SECONDS,
+                require_unlocked_package=REQUIRE_UNLOCKED_PACKAGE_AFTER_IMPORT,
+            )
+            _ensure_undo_request_not_pending(
+                active_migration,
+                target_connection=target_env,
+                require_requested=REQUIRE_UNDO_REQUESTED_AFTER_IMPORT,
+            )
         except Exception as exc:
             failed_status_id = _mark_failure_status(
                 datasource=db_instance,
@@ -1236,14 +1543,15 @@ def main() -> int:
         print("Import result:")
         print(import_result)
 
-        migration_name = getattr(current_migration, "name", None) or str(migration_obj_guid)
+        migration_name = getattr(active_migration, "name", None) or str(migration_obj_guid)
         target_status_id = _get_target_project_status_id(db_instance, target_project_name, PROJECT_ID)
-        arms_project_id = _resolve_arms_project_id(
-            db_instance,
-            PROJECT_ID,
-            project_guid=PROJECT_ID,
-            project_name=source_project_name or target_project_name,
+        arms_project_id = _resolve_target_arms_project_id(
+            request_row=request_row,
+            datasource=db_instance,
+            query_project_id=PROJECT_ID,
+            target_project_name=target_project_name,
         )
+        final_migration_id = str(getattr(active_migration, "id", migration_obj_guid))
         _insert_migration_dim_record(
             datasource=db_instance,
             project_id=PROJECT_ID,
@@ -1251,8 +1559,8 @@ def main() -> int:
             source_project_name=source_project_name,
             target_project_name=target_project_name,
             target_env_name=target_env_name,
-            migration_obj_guid=migration_obj_guid,
-            migration_id=str(current_migration.id),
+            migration_obj_guid=final_migration_id,
+            migration_id=final_migration_id,
             migration_name=str(migration_name),
             status_id=target_status_id,
             arms_project_id=arms_project_id,
