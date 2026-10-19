@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from mstrio.types import ObjectSubTypes
+import pandas as pd
+import create_package_validation_loop
 
 from create_package import (
     _build_object_insert_queries,
@@ -17,6 +19,86 @@ class Shortcut:
 
     def list_dependencies(self):
         return self._dependencies
+
+
+def test_creation_empty_report_exits_cleanly(monkeypatch, capsys):
+    module = create_package_validation_loop
+    closed = []
+    connection = type("Connection", (), {"close": lambda self: closed.append(True)})()
+    monkeypatch.setattr(module, "Connection", lambda *args, **kwargs: connection)
+    monkeypatch.setattr(module, "DatasourceInstance", lambda **kwargs: object())
+    monkeypatch.setattr(module, "Report", lambda **kwargs: type(
+        "Report", (), {"to_dataframe": lambda self: pd.DataFrame()},
+    )())
+
+    assert module.main() == 0
+    assert closed == [True]
+    assert "No requests found in the request report. No package will be created." in capsys.readouterr().out
+
+
+def test_creation_without_target_or_requestor_fields_skips_target_processing(monkeypatch, capsys):
+    module = create_package_validation_loop
+    queries = []
+    connections = []
+    created = []
+    frame = pd.DataFrame([{
+        "Project@Name": "DEV - Tutorial",
+        "Project@ID": "A" * 32,
+        "Migration Obj@Content Path": "Public Objects",
+        "Migration Obj@Name": "Test Package",
+        "Request@ID": 12,
+    }])
+
+    def connect(*args, **kwargs):
+        connections.append(kwargs)
+        return object()
+
+    class FakeDatasource:
+        def __init__(self, **kwargs):
+            pass
+
+        def execute_query(self, *, query, project_id):
+            queries.append(query)
+
+    class FakeMigration:
+        id = "package:created"
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        @staticmethod
+        def build_package_config(**kwargs):
+            return kwargs["content"]
+
+        @staticmethod
+        def create_object_migration(*args, **kwargs):
+            created.append(kwargs)
+
+        def trigger_validation(self, **kwargs):
+            raise AssertionError("Creation must not trigger target validation.")
+
+    monkeypatch.setenv("MSTR_ENABLE_VALIDATION", "true")
+    monkeypatch.setattr(module, "Connection", connect)
+    monkeypatch.setattr(module, "DatasourceInstance", FakeDatasource)
+    monkeypatch.setattr(module, "Report", lambda **kwargs: type("Report", (), {"to_dataframe": lambda self: frame})())
+    monkeypatch.setattr(module, "Folder", lambda *args, **kwargs: type("Folder", (), {"get_contents": lambda self: []})())
+    monkeypatch.setattr(module, "_resolve_folder_id", lambda *args: "folder")
+    monkeypatch.setattr(module, "_collect_package_dependencies", lambda *args, **kwargs: [{
+        "id": "B" * 32, "type": "metric", "name": "Metric",
+    }])
+    monkeypatch.setattr(module, "_delete_existing_migration_if_present", lambda *args, **kwargs: None)
+    monkeypatch.setattr(module, "Migration", FakeMigration)
+    monkeypatch.setattr(module, "_build_object_insert_queries", lambda *args: ["INSERT INTO objects VALUES (1);"])
+
+    assert module.main() == 0
+    assert len(connections) == 2
+    assert connections[1]["project_id"] == "A" * 32
+    assert len(created) == 1
+    assert created[0]["project_name"] == "DEV - Tutorial"
+    assert any("set status_id=2" in query for query in queries)
+    assert any("migration_obj_id='package:created'" in query for query in queries)
+    assert not any("validation_flag" in query or "Validation" in query for query in queries)
+    assert "Target project processing is deferred to import_package.py" in capsys.readouterr().out
 
 
 def test_collect_package_dependencies_includes_all_relevant_types_and_deduplicates(monkeypatch):

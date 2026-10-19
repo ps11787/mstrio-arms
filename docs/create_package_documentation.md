@@ -1,5 +1,26 @@
 # Documentation for create_package.py
 
+## Creation-only workflow in create_package_validation_loop.py
+
+If the initial request report is empty, the script prints that no requests were
+found, closes the connection, and exits successfully without creating a package.
+
+[create_package_validation_loop.py](../create_package_validation_loop.py) now
+creates the source package and records its contents, creation comment, migration
+reference, and request status `2` only. It does not read `Target Project@NAME` or
+`Target Project@ID`; those columns are no longer required in its report.
+
+Target connections, target validation/rebuild retries, validation comments,
+`validation_flag` updates, and validation-result emails are not performed by this
+script. Requestor lookup is also skipped because no validation email is sent.
+`MSTR_ENABLE_VALIDATION` no longer enables target processing in this script.
+Destination resolution and import remain the responsibility of
+[import_package.py](../import_package.py). No new validation workflow is added to
+the import script by this change.
+
+The validation descriptions below refer to the separate
+[create_package.py](../create_package.py), not this creation-only entry point.
+
 ## Änderungsprotokoll
 
 ### Aktuelle Korrekturen

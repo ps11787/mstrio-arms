@@ -7,7 +7,9 @@ error-handling documentation.
 from __future__ import annotations
 
 import os
+from collections.abc import Callable
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
 from time import sleep
 
 import mstrio.api.migration as migration_api
@@ -15,7 +17,6 @@ from mstrio.connection import Connection
 from mstrio.datasources.datasource_instance import DatasourceInstance
 from mstrio.object_management.migration import Migration
 from mstrio.object_management.migration.package import ImportStatus, PackageStatus
-from mstrio.project_objects.report import Report
 from mstrio.server.job_monitor import list_jobs
 
 
@@ -38,9 +39,8 @@ ENVIRONMENT_URLS.update({
     if value and value.strip()
 })
 MSTR_USERNAME = os.getenv("MSTR_USERNAME", "mstr")
-MSTR_PASSWORD = os.getenv("MSTR_PASSWORD", "EW85AcqE1SoT")
+MSTR_PASSWORD = os.getenv("MSTR_PASSWORD", "")
 PROJECT_ID = os.getenv("MSTR_PROJECT_ID", "4B0544627D49F8DA03C26D817D208263")
-REQUEST_REPORT_ID = os.getenv("MSTR_REQUEST_REPORT_ID", "A62CDD7147492E20EE83C5841B7C9183")
 DATASOURCE_INSTANCE_ID = os.getenv("MSTR_DATASOURCE_INSTANCE_ID", "A23BBC514D336D5B4FCE919FE19661A3")
 TARGET_PROJECT_TABLE = os.getenv("MSTR_TARGET_PROJECT_TABLE", "arms.t_mig_lu_tgt_project")
 STATUS_TABLE = os.getenv("MSTR_STATUS_TABLE", "arms.t_mig_lu_status")
@@ -48,9 +48,20 @@ TARGET_ENV_TABLE = os.getenv("MSTR_TARGET_ENV_TABLE", "arms.t_mig_lu_tgt_env")
 REQUEST_TABLE = os.getenv("MSTR_REQUEST_TABLE", "arms.t_mig_dim_request")
 PROJECT_LOOKUP_TABLE = os.getenv("MSTR_PROJECT_LOOKUP_TABLE", "arms.t_mig_lu_project")
 MIGRATION_OBJECT_TABLE = os.getenv("MSTR_MIGRATION_OBJECT_TABLE", "arms.t_mig_lu_migration_obj")
+TARGET_RESOLUTION_FAILED_STATUS_ID = 11
+# Require an unambiguous status/environment mapping; disable to allow legacy fallbacks.
+FORCE_STATUS_TARGET_PROJECT_RESOLUTION = os.getenv(
+    "MSTR_FORCE_STATUS_TARGET_PROJECT_RESOLUTION",
+    "true",
+).strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "y",
+}
 REQUEST_STATUS_FILTER = tuple(
     int(item.strip())
-    for item in os.getenv("MSTR_REQUEST_STATUS_FILTER", "5, 7, 9").split(",")
+    for item in os.getenv("MSTR_REQUEST_STATUS_FILTER", "5,6,7").split(",")
     if item.strip()
 )
 FORCE_UNLOCK_LOCKED_PACKAGE = os.getenv("MSTR_FORCE_UNLOCK_LOCKED_PACKAGE", "true").strip().lower() in {
@@ -146,12 +157,21 @@ def _coerce_int(value: object) -> int:
         return int(value)
     if isinstance(value, int):
         return value
-    if isinstance(value, float):
-        return int(value)
     text = str(value).strip()
     if not text:
         raise ValueError("Cannot coerce empty string to int.")
-    return int(float(text))
+    try:
+        number = Decimal(text)
+    except InvalidOperation as exc:
+        raise ValueError(f"Invalid integer value: {value!r}.") from exc
+    if not number.is_finite() or number != number.to_integral_value():
+        raise ValueError(f"Expected a finite whole number; got {value!r}.")
+    return int(number)
+
+
+def _execute_query(datasource: DatasourceInstance, *, project_id: str, query: str) -> dict:
+    print(f"Executing SQL:\n{query}", flush=True)
+    return datasource.execute_query(project_id=project_id, query=query)
 
 
 def _fetch_requests_for_statuses(
@@ -165,11 +185,12 @@ def _fetch_requests_for_statuses(
 
     status_in_list = ", ".join(str(status_id) for status_id in status_ids)
     query = (
-        f"SELECT * FROM {REQUEST_TABLE} "
-        f"WHERE status_id IN ({status_in_list}) "
-        "ORDER BY request_id DESC;"
+        f"SELECT r.*, p.project_name AS source_project_name FROM {REQUEST_TABLE} r "
+        f"LEFT JOIN {PROJECT_LOOKUP_TABLE} p ON r.project_id = p.project_id "
+        f"WHERE r.status_id IN ({status_in_list}) "
+        "ORDER BY r.request_id DESC;"
     )
-    result = datasource.execute_query(project_id=project_id, query=query)
+    result = _execute_query(datasource, project_id=project_id, query=query)
     return _rows_from_result(result)
 
 
@@ -193,7 +214,7 @@ def _resolve_migration_object_guid(
         f"SELECT * FROM {MIGRATION_OBJECT_TABLE} "
         f"WHERE migration_key_id = {migration_key_id};"
     )
-    result = datasource.execute_query(project_id=project_id, query=query)
+    result = _execute_query(datasource, project_id=project_id, query=query)
     for row in _rows_from_result(result):
         migration_obj_guid = _get_first_value_from_result_data(
             row,
@@ -210,6 +231,28 @@ def _resolve_migration_object_guid(
     return None
 
 
+def _select_request_with_migration(
+    request_rows: list[dict[str, object]],
+    datasource: DatasourceInstance,
+    project_id: str,
+) -> tuple[dict[str, object], str] | None:
+    for request_row in request_rows:
+        request_id = _get_first_value_from_result_data(
+            request_row, "request_id", "Request@ID", "request"
+        )
+        if not request_id:
+            print("Skipping request row without a request_id.")
+            continue
+        migration_guid = _resolve_migration_object_guid(datasource, project_id, request_row)
+        if migration_guid:
+            return request_row, migration_guid
+        print(
+            f"Skipping request {request_id}: no migration object GUID in "
+            f"{MIGRATION_OBJECT_TABLE}. Create its package before importing."
+        )
+    return None
+
+
 def _get_status_target_env_id(
     datasource: DatasourceInstance,
     status_id: int | str,
@@ -223,7 +266,7 @@ def _get_status_target_env_id(
     transparently fall back to the default environment instead of crashing.
     """
     query = f"SELECT * FROM {STATUS_TABLE} WHERE status_id = {status_id};"
-    result = datasource.execute_query(project_id=project_id, query=query)
+    result = _execute_query(datasource, project_id=project_id, query=query)
     for row in _rows_from_result(result):
         env_id = _get_first_value_from_result_data(
             row,
@@ -246,7 +289,7 @@ def _get_target_environment_details(
 ) -> dict[str, str]:
     """Resolve the target environment metadata from the target environment lookup table."""
     query = f"SELECT * FROM {TARGET_ENV_TABLE};"
-    result = datasource.execute_query(project_id=project_id, query=query)
+    result = _execute_query(datasource, project_id=project_id, query=query)
     for row in _rows_from_result(result):
         current_env_id = _get_first_value_from_result_data(
             row,
@@ -293,6 +336,8 @@ def _get_target_environment_details(
                     "url",
                 )
                 or "",
+                "status_id_success": _get_first_value_from_result_data(row, "status_id_success") or "",
+                "status_id_failed": _get_first_value_from_result_data(row, "status_id_failed") or "",
             }
     raise ValueError(
         f"No target environment metadata found in {TARGET_ENV_TABLE} for target environment '{target_env_id}'."
@@ -434,7 +479,7 @@ def _resolve_target_project_name_from_lookup(
             f"OR LOWER(tgt_project_name) LIKE LOWER('%{source_name.lower().replace("'", "''")}%') "
             "ORDER BY tgt_project_name ASC;"
         )
-        result = datasource.execute_query(project_id=project_id, query=query)
+        result = _execute_query(datasource, project_id=project_id, query=query)
         rows = _rows_from_result(result)
         for row in rows:
             project_name = _get_first_value_from_result_data(
@@ -464,12 +509,16 @@ def _resolve_target_project_name_from_sql(
     target_prefix: str,
     fallback_name: str | None = None,
     target_project_id: str | int | None = None,
+    *,
+    strict_status: bool = False,
 ) -> str:
     """Resolve the target project using the request status, target/source environment, and prefix.
 
     The target-project lookup should be narrowed to the relevant status/environment mapping before
     falling back to a name-derived guess. This avoids returning unrelated rows like the source
     project's project name when the proper target project is known by prefix and environment.
+    With strict_status enabled, require one distinct name matching the status,
+    environment, and environment prefix; ignore request IDs and name-derived fallbacks.
     """
     env_id = str(target_env_id).strip() if target_env_id is not None else ""
     status_id = str(request_status_id).strip() if request_status_id is not None else ""
@@ -480,13 +529,30 @@ def _resolve_target_project_name_from_sql(
     escaped_source_name = source_name.replace("'", "''")
     escaped_prefix = prefix.replace("'", "''")
 
-    if target_project_id_text:
+    if strict_status and (not status_id or not env_id):
+        raise ValueError("Strict status resolution requires a request status and target environment mapping.")
+    if strict_status and not prefix:
+        raise ValueError(
+            f"Strict status resolution requires a target project prefix in {TARGET_ENV_TABLE} "
+            f"for tgt_env_id={env_id}."
+        )
+    source_suffix = str(source_project_name or "").strip()
+    if strict_status:
+        if not source_suffix:
+            raise ValueError("Strict status resolution requires the source project name.")
+        if " - " in source_suffix:
+            _, source_suffix = source_suffix.split(" - ", 1)
+            source_suffix = source_suffix.strip()
+        if not source_suffix:
+            raise ValueError("Strict status resolution requires a non-empty source project suffix.")
+
+    if target_project_id_text and not strict_status:
         query = (
             f"SELECT * FROM {TARGET_PROJECT_TABLE} "
             f"WHERE CAST(tgt_project_id AS VARCHAR) = '{target_project_id_text}' "
             "ORDER BY status_id DESC, tgt_project_name ASC;"
         )
-        result = datasource.execute_query(project_id=project_id, query=query)
+        result = _execute_query(datasource, project_id=project_id, query=query)
         for row in _rows_from_result(result):
             project_name = _get_first_value_from_result_data(
                 row,
@@ -510,7 +576,38 @@ def _resolve_target_project_name_from_sql(
         query += " WHERE " + " AND ".join(conditions)
     query += " ORDER BY tgt_project_name ASC;"
 
-    result = datasource.execute_query(project_id=project_id, query=query)
+    result = _execute_query(datasource, project_id=project_id, query=query)
+    if strict_status:
+        project_names: set[str] = set()
+        for row in _rows_from_result(result):
+            project_name = _get_first_value_from_result_data(
+                row, "tgt_project_name", "target_project_name", "project_name"
+            )
+            if project_name:
+                cleaned = project_name.strip().rstrip("-").strip()
+                prefix_matches = cleaned.casefold().startswith(prefix.casefold())
+                remainder = cleaned[len(prefix):] if prefix_matches else ""
+                boundary_matches = (
+                    not remainder
+                    or prefix.endswith(("-", "_", "/"))
+                    or remainder[0].isspace()
+                    or remainder[0] in "-_/"
+                )
+                target_suffix = remainder.lstrip(" -_/").strip()
+                if (
+                    cleaned and prefix_matches and boundary_matches
+                    and target_suffix.casefold() == source_suffix.casefold()
+                ):
+                    project_names.add(cleaned)
+        if len(project_names) != 1:
+            raise ValueError(
+                f"Strict status resolution requires exactly one target project in {TARGET_PROJECT_TABLE} "
+                f"for status_id={status_id}, tgt_env_id={env_id}, prefix={prefix!r}, "
+                f"source suffix={source_suffix!r}; "
+                f"found {len(project_names)}: {sorted(project_names)}."
+            )
+        return next(iter(project_names))
+
     exact_matches: list[dict[str, object]] = []
     fallback_matches: list[dict[str, object]] = []
     for row in _rows_from_result(result):
@@ -642,73 +739,24 @@ def _resolve_target_project_name_from_sql(
     )
 
 
-def _get_target_project_status_id(
-    datasource: DatasourceInstance,
-    target_project_name: str,
-    project_id: str,
-) -> int:
-    """Return the status_id for the target project from the ARMS lookup table."""
-    escaped_name = target_project_name.replace("'", "''")
-    query = (
-        f"SELECT status_id FROM {TARGET_PROJECT_TABLE} "
-        f"WHERE tgt_project_name = '{escaped_name}' "
-        "ORDER BY status_id DESC"
-    )
-    result = datasource.execute_query(project_id=project_id, query=query)
-    data = result.get("results", {}).get("data", {})
-    values = data.get("status_id", [])
-    if not values:
-        raise ValueError(
-            f"No status_id found in {TARGET_PROJECT_TABLE} for target project '{target_project_name}'."
-        )
-    return _coerce_int(values[0])
-
-
-def _get_failed_status_id_for_environment(
+def _get_result_status_id_for_environment(
     datasource: DatasourceInstance,
     project_id: str,
     target_env_id: str,
-    target_env_name: str,
+    *,
+    succeeded: bool,
 ) -> int:
-    """Select the failed status row matching the target environment from the status lookup table."""
-    query = f"SELECT * FROM {STATUS_TABLE};"
-    result = datasource.execute_query(project_id=project_id, query=query)
-    env_key = str(target_env_id).strip().lower()
-    env_name_key = str(target_env_name).strip().lower()
-
-    for row in _rows_from_result(result):
-        status_id = _get_first_value_from_result_data(row, "status_id")
-        status_name = _get_first_value_from_result_data(row, "status_name", "status", "name") or ""
-        status_desc = _get_first_value_from_result_data(row, "status_desc", "description") or ""
-        row_env_id = _get_first_value_from_result_data(
-            row,
-            "tgt_env_id",
-            "target_env_id",
-            "env_id",
-            "environment_id",
-            "tgt_environment_id",
-            "target_environment_id",
-        )
-        combined = f"{status_name} {status_desc} {row_env_id or ''} {target_env_name or ''}".lower()
-        if "failed" not in combined:
-            continue
-        if row_env_id and str(row_env_id).strip().lower() == env_key:
-            return _coerce_int(status_id)
-        if env_name_key and env_name_key in combined:
-            return _coerce_int(status_id)
-
-    generic_query = (
-        f"SELECT status_id FROM {STATUS_TABLE} "
-        "WHERE LOWER(status_name) LIKE '%failed%' OR LOWER(status_desc) LIKE '%failed%' "
-        "ORDER BY status_id ASC"
-    )
-    generic_result = datasource.execute_query(project_id=project_id, query=generic_query)
-    values = generic_result.get("results", {}).get("data", {}).get("status_id", [])
-    if not values:
+    """Read the explicit result status configured for the selected target environment."""
+    column = "status_id_success" if succeeded else "status_id_failed"
+    details = _get_target_environment_details(datasource, target_env_id, project_id)
+    value = details.get(column, "")
+    try:
+        return _coerce_int(value)
+    except (TypeError, ValueError) as exc:
         raise ValueError(
-            "No failed status row found in the status lookup table for the target environment."
-        )
-    return _coerce_int(values[0])
+            f"Missing or invalid {column} in {TARGET_ENV_TABLE} "
+            f"for tgt_env_id={target_env_id}: {value!r}."
+        ) from exc
 
 
 def _sql_literal(value: object) -> str:
@@ -741,7 +789,7 @@ def _resolve_arms_project_id(
         f"SELECT project_id FROM {PROJECT_LOOKUP_TABLE} "
         f"WHERE {' OR '.join(clauses)} ORDER BY project_id ASC LIMIT 1;"
     )
-    result = datasource.execute_query(project_id=query_project_id, query=query)
+    result = _execute_query(datasource, project_id=query_project_id, query=query)
     rows = _rows_from_result(result)
     for row in rows:
         value = _get_first_value_from_result_data(row, "project_id", "id")
@@ -752,33 +800,36 @@ def _resolve_arms_project_id(
 
 
 def _resolve_target_arms_project_id(
-    request_row: dict[str, object],
     datasource: DatasourceInstance,
     query_project_id: str,
     target_project_name: str,
-) -> int | None:
-    """Resolve the numeric ARMS target project key for migration inserts.
-
-    Priority:
-    1) Use request-level `tgt_project_id`/`target_project_id` when present.
-    2) Fall back to target project name lookup in `arms.t_mig_lu_project`.
-    """
-    direct_target_project_id = _get_first_value_from_result_data(
-        request_row,
-        "tgt_project_id",
-        "target_project_id",
+) -> int:
+    """Resolve the target lookup's numeric key for the actual import destination."""
+    name = target_project_name.strip()
+    if not name:
+        raise ValueError("Target project name is required to resolve tgt_project_id.")
+    escaped_name = name.replace("'", "''")
+    query = (
+        f"SELECT tgt_project_id FROM {TARGET_PROJECT_TABLE} "
+        f"WHERE LOWER(TRIM(tgt_project_name)) = LOWER('{escaped_name}');"
     )
-    if direct_target_project_id is not None:
+    result = _execute_query(datasource, project_id=query_project_id, query=query)
+    project_ids: set[int] = set()
+    for row in _rows_from_result(result):
+        value = _get_first_value_from_result_data(row, "tgt_project_id")
         try:
-            return _coerce_int(direct_target_project_id)
-        except (TypeError, ValueError):
-            pass
-
-    return _resolve_arms_project_id(
-        datasource,
-        query_project_id,
-        project_name=target_project_name,
-    )
+            project_ids.add(_coerce_int(value))
+        except ValueError as exc:
+            raise ValueError(
+                f"Invalid tgt_project_id {value!r} in {TARGET_PROJECT_TABLE} "
+                f"for target project '{name}'."
+            ) from exc
+    if len(project_ids) != 1:
+        raise ValueError(
+            f"Expected exactly one tgt_project_id in {TARGET_PROJECT_TABLE} "
+            f"for target project '{name}'; found {len(project_ids)}: {sorted(project_ids)}."
+        )
+    return next(iter(project_ids))
 
 
 def _insert_migration_dim_record(
@@ -793,12 +844,13 @@ def _insert_migration_dim_record(
     migration_name: str,
     status_id: int | None = None,
     arms_project_id: int | str | None = None,
+    migration_message: str | None = None,
 ) -> None:
     """Insert a migration record using the actual ARMS migration table schema.
 
     The live schema exposes columns such as migration_key_id, request_id,
     migration_time, project_id, and status_id. The value written into the
-    ARMS table must be the numeric project key from arms.t_mig_lu_project,
+    ARMS table must be tgt_project_id from the configured target-project lookup,
     not the MicroStrategy project GUID used for datasource queries.
     """
     columns = [
@@ -809,12 +861,12 @@ def _insert_migration_dim_record(
         "project_id",
     ]
 
-    project_key_value = "NULL"
-    if arms_project_id is not None:
-        try:
-            project_key_value = str(_coerce_int(arms_project_id))
-        except (TypeError, ValueError):
-            project_key_value = "NULL"
+    try:
+        project_key_value = str(_coerce_int(arms_project_id))
+    except ValueError as exc:
+        raise ValueError(
+            f"A numeric tgt_project_id is required for migration history; got {arms_project_id!r}."
+        ) from exc
 
     values = [
         "(SELECT COALESCE(MAX(migration_id), 0) + 1 FROM arms.t_mig_dim_migration)",
@@ -828,6 +880,10 @@ def _insert_migration_dim_record(
         columns.append("status_id")
         values.append(str(status_id))
 
+    if migration_message is not None:
+        columns.append("migration_message")
+        values.append(_sql_literal(migration_message))
+
     query = (
         "INSERT INTO arms.t_mig_dim_migration ("
         + ", ".join(columns)
@@ -835,40 +891,7 @@ def _insert_migration_dim_record(
         + ", ".join(values)
         + ");"
     )
-    datasource.execute_query(project_id=project_id, query=query)
-
-
-def _mark_failure_status(
-    datasource: DatasourceInstance,
-    project_id: str,
-    request_id: object,
-    migration_obj_guid: str,
-    target_env_id: str,
-    target_env_name: str,
-) -> int:
-    """Set the failed status on both the migration record and request row for this environment."""
-    failed_status_id = _get_failed_status_id_for_environment(
-        datasource,
-        project_id,
-        target_env_id,
-        target_env_name,
-    )
-
-    datasource.execute_query(
-        project_id=project_id,
-        query=(
-            f"UPDATE arms.t_mig_dim_request SET status_id={failed_status_id} "
-            f"WHERE request_id={request_id};"
-        ),
-    )
-    datasource.execute_query(
-        project_id=project_id,
-        query=(
-            f"UPDATE arms.t_mig_dim_migration SET status_id={failed_status_id} "
-            f"WHERE request_id={request_id};"
-        ),
-    )
-    return failed_status_id
+    _execute_query(datasource, project_id=project_id, query=query)
 
 
 def _insert_comment(
@@ -885,19 +908,22 @@ def _insert_comment(
         "VALUES ((SELECT COALESCE(MAX(comment_id), 0) + 1 FROM arms.t_mig_comments), "
         f"{request_id}, '{escaped_comment}', CURRENT_TIMESTAMP, '{author}', 0);"
     )
-    datasource.execute_query(project_id=project_id, query=query)
+    _execute_query(datasource, project_id=project_id, query=query)
 
 
-def _wait_for_migration_completion(migration: Migration, poll_seconds: int = 5) -> ImportStatus | str | None:
+def _wait_for_migration_completion(
+    migration: Migration,
+    poll_seconds: int = 5,
+    *,
+    timeout_seconds: int = POST_IMPORT_TIMEOUT_SECONDS,
+) -> ImportStatus | str | None:
     """Poll the migration import status until it reaches a terminal state."""
     start_time = datetime.now()
+    deadline_epoch = start_time.timestamp() + timeout_seconds
     last_status = None
 
     while True:
-        try:
-            migration.fetch()
-        except Exception:
-            pass
+        migration.fetch()
 
         import_status = getattr(getattr(migration, "import_info", None), "status", None)
         status_name = getattr(import_status, "name", str(import_status))
@@ -917,6 +943,10 @@ def _wait_for_migration_completion(migration: Migration, poll_seconds: int = 5) 
         ):
             break
 
+        if datetime.now().timestamp() >= deadline_epoch:
+            raise TimeoutError(
+                f"Migration import timed out after {timeout_seconds}s; last status: {status_name}."
+            )
         sleep(poll_seconds)
 
     end_time = datetime.now()
@@ -995,10 +1025,7 @@ def _wait_for_post_import_readiness(
     last_snapshot = None
 
     while True:
-        try:
-            migration.fetch()
-        except Exception:
-            pass
+        migration.fetch()
 
         import_info = getattr(migration, "import_info", None)
         package_info = getattr(migration, "package_info", None)
@@ -1129,6 +1156,12 @@ def _list_active_migration_jobs(
     migration_guid = str(migration_obj_guid or "").strip()
     if not migration_guid:
         return []
+    if ":" in migration_guid:
+        print(
+            f"Skipping job lookup: migration ID '{migration_guid}' is composite, "
+            "not a single object GUID accepted by the job monitor. Job state is unknown."
+        )
+        return []
 
     try:
         jobs = list_jobs(connection=connection, object_id=migration_guid, limit=limit)
@@ -1175,44 +1208,50 @@ def _migrate_with_lock_retry(
     generate_undo: bool = True,
     poll_seconds: int = 5,
     max_attempts: int = 1,
+    on_reuse: Callable[[Migration], None] | None = None,
 ):
-    """Attempt the migration without deleting the migration object before import.
+    """Import normally, or reuse a locked package in a new target-bound migration.
 
-    The project policy is intentionally conservative: if a migration object is already locked,
-    the script does not delete it before a migration attempt. If FORCE_UNLOCK_LOCKED_PACKAGE is
-    set, we log the condition but still do not destructively clear the object because the object
-    ID may be unavailable or the migration may not yet exist in the target environment.
+    The original instance is never deleted. on_reuse persists the replacement reference
+    before the new import is started.
     """
 
-    def _start_migration_without_rebinding(existing_migration: Migration):
-        """Start import by changing request statuses only.
-
-        Some server states reject `migrate()` when it tries to rebind environment/project on
-        an existing migration. This path leaves binding untouched and only advances
-        import request status to trigger migration.
-        """
+    def _start_reused_migration(existing_migration: Migration):
+        """Start the newly created import instance without rebinding the locked package."""
         migration_id = str(getattr(existing_migration, "id", "")).strip()
         if not migration_id:
             raise ValueError("Migration object has no valid ID.")
 
         source_conn = existing_migration.connection
 
-        migration_api.update_migration(
-            connection=source_conn,
-            migration_id=migration_id,
-            body={"importInfo": {"importRequestStatus": "requested"}},
-        )
-        migration_api.update_migration(
-            connection=source_conn,
-            migration_id=migration_id,
-            body={"importInfo": {"importRequestStatus": "approved"}},
-        )
+        def _validate_target_binding(body: dict) -> None:
+            import_info = body.get("importInfo") or {}
+            bound_project_id = str((import_info.get("project") or {}).get("id") or "").strip()
+            expected_project_id = str(getattr(target_env, "project_id", "") or "").strip()
+            bound_environment = str((import_info.get("environment") or {}).get("id") or "").rstrip("/")
+            expected_environment = str(getattr(target_env, "base_url", "") or "").rstrip("/")
+            if (
+                not expected_project_id
+                or bound_project_id.lower() != expected_project_id.lower()
+                or not expected_environment
+                or bound_environment.lower() != expected_environment.lower()
+            ):
+                raise RuntimeError(
+                    f"Locked migration '{migration_id}' cannot be rebound: saved import project "
+                    f"'{bound_project_id}' on '{bound_environment}' does not match selected target "
+                    f"'{expected_project_id}' on '{expected_environment}'. "
+                    "Create and validate a migration bound to the intended target before importing. "
+                    "The script will not change the project header to import into a different project."
+                )
 
-        fetched_body = migration_api.get_migration(
+        existing_body = migration_api.get_migration(
             connection=source_conn,
             migration_id=migration_id,
             show_content="all",
         ).json()
+        _validate_target_binding(existing_body)
+
+        fetched_body = existing_body
         fetched_body["packageInfo"]["replicated"] = True
 
         return migration_api.start_migration(
@@ -1230,6 +1269,8 @@ def _migrate_with_lock_retry(
         package_id = str(getattr(existing_migration.package_info, "id", "")).strip()
         if not package_id:
             raise ValueError("Migration package ID is missing; cannot clone migration.")
+        if not getattr(target_env, "project_id", None) or not getattr(target_env, "base_url", None):
+            raise ValueError("Package reuse requires a target project ID and environment URL.")
 
         base_url = str(getattr(target_env, "base_url", "") or "").strip()
         target_env_id = base_url if base_url.endswith("/") else f"{base_url}/"
@@ -1273,12 +1314,12 @@ def _migrate_with_lock_retry(
                 print(
                     f"Package '{getattr(migration, 'name', getattr(migration, 'id', 'unknown'))}' is locked; "
                     "FORCE_UNLOCK_LOCKED_PACKAGE is enabled, but this script will not delete the migration object "
-                    "before import. The migration is left untouched and the workflow stops safely."
+                    "before import."
                 )
 
             print(
                 f"Package '{getattr(migration, 'name', getattr(migration, 'id', 'unknown'))}' is locked; "
-                "retrying with status-only import start without rebinding target metadata."
+                "reusing the package in a new migration bound to the selected target."
             )
 
             has_runtime_metadata = bool(str(getattr(migration, "id", "")).strip()) and hasattr(
@@ -1287,28 +1328,12 @@ def _migrate_with_lock_retry(
             if not has_runtime_metadata:
                 raise
 
-            try:
-                start_response = _start_migration_without_rebinding(migration)
-                print(
-                    "Locked-package fallback started import successfully "
-                    f"for migration '{getattr(migration, 'id', 'unknown')}'."
-                )
-                return start_response, migration
-            except Exception as start_exc:
-                if "Import status must be 'pending'" not in str(start_exc):
-                    raise
-
-                print(
-                    "Existing migration import status is not pending; cloning migration from package "
-                    "and retrying import on the cloned object."
-                )
-                cloned_migration = _clone_migration_for_reimport(migration)
-                start_response = _start_migration_without_rebinding(cloned_migration)
-                print(
-                    "Cloned-migration fallback started import successfully "
-                    f"for migration '{getattr(cloned_migration, 'id', 'unknown')}'."
-                )
-                return start_response, cloned_migration
+            cloned_migration = _clone_migration_for_reimport(migration)
+            if on_reuse is not None:
+                on_reuse(cloned_migration)
+            start_response = _start_reused_migration(cloned_migration)
+            print(f"Reused-package import started for migration '{cloned_migration.id}'.")
+            return start_response, cloned_migration
 
     raise RuntimeError("Migration retry loop exited without executing the package import.")
 
@@ -1330,7 +1355,12 @@ def main() -> int:
             f"No requests found in {REQUEST_TABLE} with status_id in {REQUEST_STATUS_FILTER}."
         )
 
-    request_row = request_rows[0]
+    selected_request = _select_request_with_migration(request_rows, db_instance, PROJECT_ID)
+    if selected_request is None:
+        print("No matching requests have a migration package available to import.")
+        my_conn.close()
+        return 0
+    request_row, migration_obj_guid = selected_request
     request_id = _get_first_value_from_result_data(
         request_row,
         "request_id",
@@ -1338,39 +1368,9 @@ def main() -> int:
         "request",
     )
     print(f"Retrieved request number: {request_id}")
-    migration_obj_guid = _resolve_migration_object_guid(db_instance, PROJECT_ID, request_row) or ""
-
-    request_report = None
-    report_source_project_name = ""
-    report_target_project_name = ""
-    try:
-        request_report = Report(connection=my_conn, id=REQUEST_REPORT_ID)
-        df = request_report.to_dataframe()
-        if not df.empty:
-            report_row = df.iloc[0].to_dict()
-            report_source_project_name = _get_first_value_from_result_data(
-                report_row,
-                "source_project_name",
-                "source_project",
-                "project_name",
-                "Project@Name",
-                "Project@NAME",
-                "project",
-            ) or ""
-            report_target_project_name = _get_first_value_from_result_data(
-                report_row,
-                "target_project_name",
-                "Target Project@NAME",
-                "Target Project@NAME",
-                "target_project",
-            ) or ""
-    except Exception:
-        report_source_project_name = ""
-        report_target_project_name = ""
 
     source_project_name = (
-        report_source_project_name
-        or _get_first_value_from_result_data(
+        _get_first_value_from_result_data(
             request_row,
             "source_project_name",
             "project_name",
@@ -1388,8 +1388,7 @@ def main() -> int:
         "status",
     )
     target_project_name_from_request = (
-        report_target_project_name
-        or _get_first_value_from_result_data(
+        _get_first_value_from_result_data(
             request_row,
             "target_project_name",
             "Target Project@NAME",
@@ -1397,7 +1396,7 @@ def main() -> int:
         )
         or ""
     )
-    if not source_project_name and target_project_name_from_request:
+    if not FORCE_STATUS_TARGET_PROJECT_RESOLUTION and not source_project_name and target_project_name_from_request:
         source_project_name = target_project_name_from_request
 
     if not request_id:
@@ -1411,30 +1410,48 @@ def main() -> int:
     target_env_url = BASE_URL
     target_env_id = None
 
-    if request_status_id is None or str(request_status_id).strip() == "":
-        target_project_name = _get_first_value_from_result_data(
-            request_row,
-            "target_project_name",
-            "Target Project@NAME",
-            "target_project",
-            "target_project_name",
-        )
-        if not target_project_name:
-            raise ValueError(
-                f"Request {request_id} does not contain a status mapping or a target project name."
+    try:
+        if request_status_id is None or str(request_status_id).strip() == "":
+            if FORCE_STATUS_TARGET_PROJECT_RESOLUTION:
+                raise ValueError(f"Request {request_id} has no status_id; strict status resolution cannot continue.")
+            target_project_name = _get_first_value_from_result_data(
+                request_row,
+                "target_project_name",
+                "Target Project@NAME",
+                "target_project",
+                "target_project_name",
             )
-    else:
-        target_env_id = _get_status_target_env_id(db_instance, request_status_id, PROJECT_ID)
-        if target_env_id:
-            target_env_details = _get_target_environment_details(db_instance, target_env_id, PROJECT_ID)
-            target_env_name = target_env_details.get("env_name", str(target_env_id).strip())
-            target_env_url = target_env_details.get("url") or _resolve_target_environment_url(
-                BASE_URL,
-                SOURCE_ENVIRONMENT,
-                target_env_name,
-                ENVIRONMENT_URLS,
-            )
-            target_project_prefix = target_env_details.get("prefix", "")
+            if not target_project_name:
+                raise ValueError(
+                    f"Request {request_id} does not contain a status mapping or a target project name."
+                )
+        else:
+            target_env_id = _get_status_target_env_id(db_instance, request_status_id, PROJECT_ID)
+            if FORCE_STATUS_TARGET_PROJECT_RESOLUTION and not target_env_id:
+                raise ValueError(
+                    f"Request {request_id}: status_id={request_status_id} has no target environment mapping "
+                    f"in {STATUS_TABLE}; strict status resolution cannot continue."
+                )
+            target_project_prefix = ""
+            if target_env_id:
+                target_env_details = _get_target_environment_details(db_instance, target_env_id, PROJECT_ID)
+                target_env_name = target_env_details.get("env_name", str(target_env_id).strip())
+                target_env_url = target_env_details.get("url") or _resolve_target_environment_url(
+                    BASE_URL,
+                    SOURCE_ENVIRONMENT,
+                    target_env_name,
+                    ENVIRONMENT_URLS,
+                )
+                target_project_prefix = target_env_details.get("prefix", "")
+            else:
+                target_env_name = SOURCE_ENVIRONMENT
+                target_env_url = _resolve_target_environment_url(
+                    BASE_URL,
+                    SOURCE_ENVIRONMENT,
+                    target_env_name,
+                    ENVIRONMENT_URLS,
+                )
+
             target_project_name = _resolve_target_project_name_from_sql(
                 db_instance,
                 PROJECT_ID,
@@ -1443,23 +1460,65 @@ def main() -> int:
                 source_project_name,
                 target_project_prefix,
                 target_project_name_from_request,
-                request_row.get("tgt_project_id") or request_row.get("target_project_id"),
+                (
+                    None
+                    if FORCE_STATUS_TARGET_PROJECT_RESOLUTION
+                    else request_row.get("tgt_project_id") or request_row.get("target_project_id")
+                ),
+                strict_status=FORCE_STATUS_TARGET_PROJECT_RESOLUTION,
             )
-        else:
-            target_project_name = _get_first_value_from_result_data(
-                request_row,
-                "target_project_name",
-                "Target Project@NAME",
-                "target_project",
-                "target_project_name",
-            ) or source_project_name
-            target_env_name = SOURCE_ENVIRONMENT
-            target_env_url = _resolve_target_environment_url(
-                BASE_URL,
-                SOURCE_ENVIRONMENT,
-                target_env_name,
-                ENVIRONMENT_URLS,
+    except ValueError as exc:
+        message = "Unable to resolve matchine Target Project name. Please check Environment/Status/Project mapping."
+        print(message)
+        print(f"Target project resolution failed for request {request_id}: {exc}")
+        try:
+            _insert_comment(
+                datasource=db_instance,
+                project_id=PROJECT_ID,
+                request_id=request_id,
+                comment_text=message,
             )
+            resolution_failed_status_id = TARGET_RESOLUTION_FAILED_STATUS_ID
+            if target_env_id:
+                try:
+                    resolution_failed_status_id = _get_result_status_id_for_environment(
+                        db_instance, PROJECT_ID, target_env_id, succeeded=False,
+                    )
+                except ValueError as status_exc:
+                    print(
+                        f"Unable to resolve environment failure status: {status_exc}. "
+                        f"Using fallback status_id={resolution_failed_status_id}."
+                    )
+            _execute_query(
+                db_instance,
+                project_id=PROJECT_ID,
+                query=(
+                    f"UPDATE {REQUEST_TABLE} SET status_id={resolution_failed_status_id} "
+                    f"WHERE request_id={request_id};"
+                ),
+            )
+            _execute_query(
+                db_instance,
+                project_id=PROJECT_ID,
+                query=(
+                    f"UPDATE arms.t_mig_dim_migration SET status_id={resolution_failed_status_id} "
+                    f"WHERE request_id={request_id} AND migration_id=("
+                    "SELECT MAX(migration_id) FROM arms.t_mig_dim_migration "
+                    f"WHERE request_id={request_id});"
+                ),
+            )
+            print(
+                f"Set request {request_id} and its latest migration record, if present, "
+                f"to status_id={resolution_failed_status_id}."
+            )
+        except Exception as writeback_exc:
+            raise RuntimeError(
+                f"Target project resolution failed: {exc}. "
+                f"Unable to persist resolution-failure comment/statuses: {writeback_exc}"
+            ) from writeback_exc
+        finally:
+            my_conn.close()
+        raise
 
     print(f"Resolved target project name: {target_project_name}")
     print(
@@ -1478,19 +1537,46 @@ def main() -> int:
     )
 
     target_env = None
+    active_migration = None
     try:
-        target_env = Connection(
-            target_env_url,
-            MSTR_USERNAME,
-            MSTR_PASSWORD,
-            project_name=target_project_name,
+        if not target_env_id:
+            raise ValueError("A target environment mapping is required to resolve migration result statuses.")
+        success_status_id = _get_result_status_id_for_environment(
+            db_instance, PROJECT_ID, target_env_id, succeeded=True,
         )
-
-        current_migration = Migration(my_conn, id=migration_obj_guid)
-        _list_active_migration_jobs(my_conn, migration_obj_guid, limit=20)
-        print("Starting package import...")
-
+        failed_status_id = _get_result_status_id_for_environment(
+            db_instance, PROJECT_ID, target_env_id, succeeded=False,
+        )
+        arms_project_id = _resolve_target_arms_project_id(
+            datasource=db_instance,
+            query_project_id=PROJECT_ID,
+            target_project_name=target_project_name,
+        )
         try:
+            target_env = Connection(
+                target_env_url,
+                MSTR_USERNAME,
+                MSTR_PASSWORD,
+                project_name=target_project_name,
+            )
+            current_migration = Migration(my_conn, id=migration_obj_guid)
+            _list_active_migration_jobs(my_conn, migration_obj_guid, limit=20)
+            print("Starting package import...")
+            def record_reused_migration(reused_migration: Migration) -> None:
+                nonlocal active_migration
+                active_migration = reused_migration
+                _execute_query(
+                    db_instance,
+                    project_id=PROJECT_ID,
+                    query=(
+                        f"UPDATE {MIGRATION_OBJECT_TABLE} "
+                        f"SET migration_obj_id={_sql_literal(reused_migration.id)}, "
+                        "migration_obj_cre_time=CURRENT_TIMESTAMP "
+                        f"WHERE migration_key_id=(SELECT migration_key_id FROM {REQUEST_TABLE} "
+                        f"WHERE request_id={request_id});"
+                    ),
+                )
+
             migration_start_time = datetime.now()
             print(
                 f"Starting migration at {migration_start_time.strftime('%Y-%m-%d %H:%M:%S')} "
@@ -1503,9 +1589,15 @@ def main() -> int:
                 generate_undo=True,
                 poll_seconds=5,
                 max_attempts=1,
+                on_reuse=record_reused_migration,
             )
             import_status = _wait_for_migration_completion(active_migration)
             print(f"Migration import status final value: {getattr(import_status, 'name', str(import_status))}")
+            if import_status != ImportStatus.IMPORTED:
+                raise RuntimeError(
+                    "Migration did not complete a successful import: "
+                    f"{getattr(import_status, 'name', str(import_status))}."
+                )
             _wait_for_post_import_readiness(
                 active_migration,
                 poll_seconds=POST_IMPORT_POLL_SECONDS,
@@ -1518,39 +1610,52 @@ def main() -> int:
                 require_requested=REQUIRE_UNDO_REQUESTED_AFTER_IMPORT,
             )
         except Exception as exc:
-            failed_status_id = _mark_failure_status(
-                datasource=db_instance,
-                project_id=PROJECT_ID,
-                request_id=request_id,
-                migration_obj_guid=migration_obj_guid,
-                target_env_id=str(target_env_id).strip() if target_env_id is not None else str(target_env_name).strip(),
-                target_env_name=target_env_name,
-            )
             error_message = f"Migration failed for request {request_id} on target environment '{target_env_name}': {exc}"
-            _insert_comment(
-                datasource=db_instance,
-                project_id=PROJECT_ID,
-                request_id=request_id,
-                comment_text=error_message,
-            )
+            print(error_message)
+            try:
+                _execute_query(
+                    db_instance,
+                    project_id=PROJECT_ID,
+                    query=(
+                        f"UPDATE {REQUEST_TABLE} SET status_id={failed_status_id} "
+                        f"WHERE request_id={request_id};"
+                    ),
+                )
+                _insert_migration_dim_record(
+                    datasource=db_instance,
+                    project_id=PROJECT_ID,
+                    request_id=request_id,
+                    source_project_name=source_project_name,
+                    target_project_name=target_project_name,
+                    target_env_name=target_env_name,
+                    migration_obj_guid=str(getattr(active_migration, "id", migration_obj_guid)),
+                    migration_id=str(getattr(active_migration, "id", migration_obj_guid)),
+                    migration_name=str(getattr(active_migration, "name", migration_obj_guid)),
+                    status_id=failed_status_id,
+                    arms_project_id=arms_project_id,
+                    migration_message=error_message,
+                )
+                _insert_comment(
+                    datasource=db_instance,
+                    project_id=PROJECT_ID,
+                    request_id=request_id,
+                    comment_text=error_message,
+                )
+            except Exception as writeback_exc:
+                raise RuntimeError(
+                    f"{error_message}\nFailed to persist failure status/history/comment: {writeback_exc}"
+                ) from writeback_exc
             print(
-                f"Migration failed for request {request_id}; set request and migration tables to "
+                f"Migration failed for request {request_id}; updated request and recorded migration attempt with "
                 f"status_id={failed_status_id} for environment '{target_env_name}'."
             )
-            print(error_message)
             raise
 
         print("Import result:")
         print(import_result)
 
         migration_name = getattr(active_migration, "name", None) or str(migration_obj_guid)
-        target_status_id = _get_target_project_status_id(db_instance, target_project_name, PROJECT_ID)
-        arms_project_id = _resolve_target_arms_project_id(
-            request_row=request_row,
-            datasource=db_instance,
-            query_project_id=PROJECT_ID,
-            target_project_name=target_project_name,
-        )
+        target_status_id = success_status_id
         final_migration_id = str(getattr(active_migration, "id", migration_obj_guid))
         _insert_migration_dim_record(
             datasource=db_instance,
@@ -1582,8 +1687,9 @@ def main() -> int:
             f"Updating request {request_id} status to target status_id {target_status_id} "
             f"for target project '{target_project_name}'."
         )
-        db_instance.execute_query(
-            query=f"UPDATE arms.t_mig_dim_request SET status_id={target_status_id} WHERE request_id={request_id};",
+        _execute_query(
+            db_instance,
+            query=f"UPDATE {REQUEST_TABLE} SET status_id={target_status_id} WHERE request_id={request_id};",
             project_id=PROJECT_ID,
         )
         return 0

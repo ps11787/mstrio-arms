@@ -3,24 +3,20 @@ from mstrio.object_management.object import Object
 from mstrio.datasources.datasource_instance import DatasourceInstance
 from mstrio.project_objects.report import Report
 from mstrio.object_management.folder import Folder, get_folder_id_from_path, list_folders
-from mstrio.object_management.migration.package import Action, ValidationStatus
+from mstrio.object_management.migration.package import Action
 from mstrio.object_management.migration import PackageSettings, Migration
-from mstrio.distribution_services.email import send_email
 from mstrio.users_and_groups import User
 from mstrio.types import ObjectSubTypes, ObjectTypes
 from datetime import datetime
-from html import escape
 import re
-from time import sleep
 from mstrio.connection import Connection
 
 BASE_URL = os.getenv("MSTR_BASE_URL", "https://env-371825.ma.cloud.microstrategy.com/MicroStrategyLibrary")
 MSTR_USERNAME = os.getenv("MSTR_USERNAME", "mstr")
-MSTR_PASSWORD = os.getenv("MSTR_PASSWORD", "EW85AcqE1SoT")
+MSTR_PASSWORD = os.getenv("MSTR_PASSWORD", "")
 PROJECT_ID = os.getenv("MSTR_PROJECT_ID", "4B0544627D49F8DA03C26D817D208263")
 DATASOURCE_INSTANCE_ID = os.getenv("MSTR_DATASOURCE_INSTANCE_ID", "A23BBC514D336D5B4FCE919FE19661A3")
 REQUEST_REPORT_ID = os.getenv("MSTR_REQUEST_REPORT_ID", "A62CDD7147492E20EE83C5841B7C9183")
-ENABLE_VALIDATION = os.getenv("MSTR_ENABLE_VALIDATION", "false").strip().lower() in {"1", "true", "yes", "y"}
 
 
 def _normalize_mstr_folder_path(project_name, migration_path):
@@ -561,6 +557,10 @@ def main() -> int:
 
     request_list = Report(connection=myConn, id=REQUEST_REPORT_ID)
     df = request_list.to_dataframe()
+    if df.empty:
+        print("No requests found in the request report. No package will be created.")
+        myConn.close()
+        return 0
 
     source_project_name = str(df['Project@Name'].iloc[0]).strip()
     source_project_id = str(df['Project@ID'].iloc[0]).strip()
@@ -580,16 +580,10 @@ def main() -> int:
     migration_content_path = str(df['Migration Obj@Content Path'].iloc[0])
     shortcut_path = _normalize_mstr_folder_path(project_name, migration_content_path)
     request_id = df['Request@ID'].iloc[0]
-    target_project_name = str(df['Target Project@NAME'].iloc[0]).strip()
-    requestor_recipients = _resolve_requestor_recipient_ids(
-        myConn,
-        _get_requestor_recipients(df.iloc[0]),
-    )
     print(
         "Retrieved migration parameters:\n"
         f"  Request ID: {request_id}\n"
         f"  Source project: {project_name}\n"
-        f"  Target project: {target_project_name}\n"
         f"  Shortcut path: {shortcut_path}"
     )
     shortcuts4Migration = Folder(source_project_conn, id=_resolve_folder_id(source_project_conn, shortcut_path, project_name)).get_contents()
@@ -719,148 +713,7 @@ def main() -> int:
     print("SQL: updating request status")
     db_instance.execute_query(query=sql_query_upd_req_table, project_id=PROJECT_ID)
 
-    if ENABLE_VALIDATION:
-        targetENV = Connection(BASE_URL, MSTR_USERNAME, MSTR_PASSWORD, project_name=target_project_name)
-        validation_retry_count = 0
-        added_missing_object_ids = set()
-        validation_failure_comment_written = False
-        while True:
-            validation_trigger_result = current_migration.trigger_validation(target_env=targetENV, target_project_name=target_project_name)
-            print("Validation trigger response:")
-            print(validation_trigger_result)
-            print("Monitoring validation status...")
-            last_snapshot = None
-            while True:
-                validation_result = current_migration.validation
-                if callable(validation_result):
-                    validation_result = validation_result()
-                status = validation_result.status
-                status_text = getattr(status, "name", str(status))
-                snapshot = (status_text, validation_result.progress, validation_result.message)
-                if snapshot != last_snapshot:
-                    print(f"Validation status: {status_text}; progress: {validation_result.progress}; message: {validation_result.message}; created: {_format_dt_userfriendly(validation_result.creation_date)}; last update: {_format_dt_userfriendly(validation_result.last_update_date)}")
-                    last_snapshot = snapshot
-                if status in (ValidationStatus.VALIDATED, ValidationStatus.VALIDATION_FAILED):
-                    break
-                sleep(5)
-            if validation_result.status != ValidationStatus.VALIDATION_FAILED:
-                break
-            print("Validation failed message:", validation_result.message)
-            if not validation_failure_comment_written:
-                failure_comment = f"Validation failed for {target_project_name}"
-                if validation_result.message:
-                    failure_comment = f"{failure_comment}: {validation_result.message}"
-                failure_comment_escaped = failure_comment.replace("'", "''")
-                sql_query_insert_validation_failure_comment = (
-                    f"INSERT INTO arms.t_mig_comments(comment_id,request_id,comment_text,comment_time,comment_author,human_flag) "
-                    f"VALUES ((select max (comment_id) + 1 from arms.t_mig_comments),{request_id},'{failure_comment_escaped}',current_timestamp,'system',0);"
-                )
-                print("SQL: recording first validation failure comment")
-                db_instance.execute_query(query=sql_query_insert_validation_failure_comment, project_id=PROJECT_ID)
-                validation_failure_comment_written = True
-            missing_object = _parse_missing_object(validation_result.message)
-            if not missing_object:
-                print("Could not identify a missing object ID and type; retrying validation.")
-                continue
-            if missing_object["id"] in added_missing_object_ids:
-                print(f"Object {missing_object['id']} is already in the package; retrying validation.")
-                continue
-            print(f"Validation failed; adding missing object {missing_object['id']} of type {missing_object['type']} and retrying.")
-            missing_object_info = Object(connection=myConn, id=missing_object["id"], type=missing_object["type"])
-            objects4Migration.append({"id": missing_object_info.id, "type": missing_object_info.type, "name": missing_object_info.name, "date_modified": missing_object_info.date_modified})
-            objects4Migration_properties.append({"id": missing_object_info.id, "type": missing_object_info.type, "name": missing_object_info.name, "location": missing_object_info.location, "date_created": missing_object_info.date_created, "date_modified": missing_object_info.date_modified})
-            added_missing_object_ids.add(missing_object["id"])
-            validation_retry_count += 1
-            myPackageConfig = Migration.build_package_config(connection=myConn, content=objects4Migration, package_settings=myPackageSettings)
-            current_migration.delete(force=True)
-            package_name = f"Req_{request_id}_{df['Migration Obj@Name'].iloc[0]}_{datetime.now().strftime('%Y%m%d%H%M%S')}_retry{validation_retry_count}"
-            Migration.create_object_migration(myConn, toc_view=myPackageConfig, name=package_name, project_name=df['Project@Name'].iloc[0])
-            current_migration = Migration(myConn, name=package_name)
-            migration_id = current_migration.id
-            print("SQL: clearing migration objects after retry")
-            db_instance.execute_query(query=f"delete from arms.t_mig_dim_objects where migration_key_id=(select migration_key_id from arms.t_mig_dim_request where request_id={request_id});", project_id=PROJECT_ID)
-            sql_queries_insert_objects = _build_object_insert_queries(objects4Migration_properties, request_id)
-            print("SQL: inserting migration objects after retry")
-            db_instance.execute_query(query="\n".join(sql_queries_insert_objects), project_id=PROJECT_ID)
-            sql_query_insert_migration = f"Update arms.t_mig_lu_migration_obj set migration_obj_id='{migration_id}',migration_obj_cre_time=current_timestamp WHERE migration_key_id=(select migration_key_id from arms.t_mig_dim_request where request_id={request_id});"
-            print("SQL: updating migration package ID after retry")
-            db_instance.execute_query(query=sql_query_insert_migration, project_id=PROJECT_ID)
-
-        print("Validation result:")
-        print({
-            "status": getattr(validation_result.status, "name", str(validation_result.status)),
-            "progress": validation_result.progress,
-            "message": validation_result.message,
-            "creation_date": _format_dt_userfriendly(validation_result.creation_date),
-            "last_update_date": _format_dt_userfriendly(validation_result.last_update_date),
-        })
-
-        raw_validation_message = (validation_result.message or "").strip()
-        if validation_result.status == ValidationStatus.VALIDATED:
-            validation_flag = 1
-            validation_message = f"Validation Success for {target_project_name}"
-            validation_message_escaped = validation_message.replace("'", "''")
-            sql_query_insert_validation_comment = (
-                f"INSERT INTO arms.t_mig_comments(comment_id,request_id,comment_text,comment_time,comment_author,human_flag) "
-                f"VALUES ((select max (comment_id) + 1 from arms.t_mig_comments),{request_id},'{validation_message_escaped}',current_timestamp,'system',0);"
-            )
-            print("SQL: recording validation success comment")
-            db_instance.execute_query(query=sql_query_insert_validation_comment, project_id=PROJECT_ID)
-        else:
-            validation_flag = 0
-            validation_message = f"VALIDATION FAILED for {target_project_name}"
-            if raw_validation_message:
-                validation_message = f"{validation_message}: {raw_validation_message}"
-
-        sql_query_update_validation_flag = (
-            f"UPDATE arms.t_mig_dim_request SET validation_flag={validation_flag} "
-            f"WHERE request_id={request_id};"
-        )
-        print("SQL: updating validation flag")
-        db_instance.execute_query(query=sql_query_update_validation_flag, project_id=PROJECT_ID)
-
-        email_subject = f"Migration package validation result for request {request_id}"
-        validation_status_text = getattr(validation_result.status, 'name', str(validation_result.status))
-        email_content = "\n".join([
-            "<html>",
-            '    <body style="font-family: Segoe UI, Arial, sans-serif; color: #1f2937;">',
-            '        <h2 style="margin-bottom: 12px;">Migration Package Validation Result</h2>',
-            f'        <p style="margin-bottom: 16px;">The package workflow has finished for request <strong>{escape(str(request_id))}</strong>.</p>',
-            '        <table style="border-collapse: collapse; min-width: 480px;">',
-            '            <tr>',
-            '                <td style="padding: 8px 12px; border: 1px solid #d1d5db; font-weight: 600;">Request ID</td>',
-            f'                <td style="padding: 8px 12px; border: 1px solid #d1d5db;">{escape(str(request_id))}</td>',
-            '            </tr>',
-            '            <tr>',
-            '                <td style="padding: 8px 12px; border: 1px solid #d1d5db; font-weight: 600;">Source project</td>',
-            f'                <td style="padding: 8px 12px; border: 1px solid #d1d5db;">{escape(str(project_name))}</td>',
-            '            </tr>',
-            '            <tr>',
-            '                <td style="padding: 8px 12px; border: 1px solid #d1d5db; font-weight: 600;">Target project</td>',
-            f'                <td style="padding: 8px 12px; border: 1px solid #d1d5db;">{escape(str(target_project_name))}</td>',
-            '            </tr>',
-            '            <tr>',
-            '                <td style="padding: 8px 12px; border: 1px solid #d1d5db; font-weight: 600;">Package name</td>',
-            f'                <td style="padding: 8px 12px; border: 1px solid #d1d5db;">{escape(str(package_name))}</td>',
-            '            </tr>',
-            '            <tr>',
-            '                <td style="padding: 8px 12px; border: 1px solid #d1d5db; font-weight: 600;">Validation status</td>',
-            f'                <td style="padding: 8px 12px; border: 1px solid #d1d5db;">{escape(str(validation_status_text))}</td>',
-            '            </tr>',
-            '            <tr>',
-            '                <td style="padding: 8px 12px; border: 1px solid #d1d5db; font-weight: 600;">Validation flag</td>',
-            f'                <td style="padding: 8px 12px; border: 1px solid #d1d5db;">{escape(str(validation_flag))}</td>',
-            '            </tr>',
-            '            <tr>',
-            '                <td style="padding: 8px 12px; border: 1px solid #d1d5db; font-weight: 600; vertical-align: top;">Details</td>',
-            f'                <td style="padding: 8px 12px; border: 1px solid #d1d5db;">{escape(str(validation_message))}</td>',
-            '            </tr>',
-            '        </table>',
-            '    </body>',
-            '</html>',
-        ])
-        print(f"Sending email notification to: {', '.join(requestor_recipients)}")
-        send_email(connection=myConn, users=requestor_recipients, subject=email_subject, content=email_content, is_html=True)
+    print("Target project processing is deferred to import_package.py; package creation only.")
 
     print("Create package proces completed for Request ID: ", df['Request@ID'].iloc[0])
     return 0
@@ -868,4 +721,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
