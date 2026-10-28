@@ -1,4 +1,4 @@
-import os
+from getpass import getpass
 from mstrio.object_management.object import Object
 from mstrio.datasources.datasource_instance import DatasourceInstance
 from mstrio.project_objects.report import Report
@@ -9,14 +9,22 @@ from mstrio.users_and_groups import User
 from mstrio.types import ObjectSubTypes, ObjectTypes
 from datetime import datetime
 import re
-from mstrio.connection import Connection
+import import_package
+from mstrio.connection import Connection, get_connection
 
-BASE_URL = os.getenv("MSTR_BASE_URL", "https://env-371825.ma.cloud.microstrategy.com/MicroStrategyLibrary")
-MSTR_USERNAME = os.getenv("MSTR_USERNAME", "mstr")
-MSTR_PASSWORD = os.getenv("MSTR_PASSWORD", "")
-PROJECT_ID = os.getenv("MSTR_PROJECT_ID", "4B0544627D49F8DA03C26D817D208263")
-DATASOURCE_INSTANCE_ID = os.getenv("MSTR_DATASOURCE_INSTANCE_ID", "A23BBC514D336D5B4FCE919FE19661A3")
-REQUEST_REPORT_ID = os.getenv("MSTR_REQUEST_REPORT_ID", "A62CDD7147492E20EE83C5841B7C9183")
+try:
+    import config_local as _local_config
+except ImportError:
+    _local_config = None
+
+BASE_URL = "https://env-371825.ma.cloud.microstrategy.com/MicroStrategyLibrary"
+API_TOKEN = getattr(_local_config, "API_TOKEN", "")
+PROJECT_ID = "4B0544627D49F8DA03C26D817D208263"
+DATASOURCE_INSTANCE_ID = "A23BBC514D336D5B4FCE919FE19661A3"
+REQUEST_REPORT_ID = "A62CDD7147492E20EE83C5841B7C9183"
+TARGET_ENV_URL = BASE_URL
+TABLE_PREFIX = "arms."
+IN_PROGRESS_STATUS_ID = 17
 
 
 def _normalize_mstr_folder_path(project_name, migration_path):
@@ -459,7 +467,7 @@ def _db_object_type_name(value):
 
 def _build_object_insert_queries(object_properties, request_id):
     return [
-        f"INSERT INTO arms.t_mig_dim_objects(id,type,name,location,date_created,date_modified,keyid,migration_key_id) VALUES ('{_sql_literal(item['id'])}','{_sql_literal(_db_object_type_name(item['type']))}','{_sql_literal(item['name'])}','{_sql_literal(item['location'])}', '{_sql_literal(item['date_created'])}','{_sql_literal(item['date_modified'])}', (select max(keyid) +1 from arms.t_mig_dim_objects),(select migration_key_id from arms.t_mig_dim_request where request_id={request_id}));"
+        f"INSERT INTO {TABLE_PREFIX}t_mig_dim_objects(id,type,name,location,date_created,date_modified,keyid,migration_key_id) VALUES ('{_sql_literal(item['id'])}','{_sql_literal(_db_object_type_name(item['type']))}','{_sql_literal(item['name'])}','{_sql_literal(item['location'])}', '{_sql_literal(item['date_created'])}','{_sql_literal(item['date_modified'])}', (select max(keyid) +1 from {TABLE_PREFIX}t_mig_dim_objects),(select migration_key_id from {TABLE_PREFIX}t_mig_dim_request where request_id={request_id}));"
         for item in object_properties
     ]
 
@@ -550,9 +558,45 @@ def _get_requestor_recipients(request_row):
 
     raise ValueError("No requestor user ID found in the request report.")
 
-def main() -> int:
+def _record_package_failure(db_instance, request_id, target_project_name, message):
+    """Persist the server's failure text to the request comment and migration history."""
+    print(f"Package processing failed for request {request_id}: {message}")
+    try:
+        arms_project_id = import_package._resolve_target_arms_project_id(
+            db_instance, PROJECT_ID, target_project_name,
+            target_project_table=f"{TABLE_PREFIX}t_mig_lu_tgt_project",
+        )
+        db_instance.execute_query(
+            query=(
+                f"INSERT INTO {TABLE_PREFIX}t_mig_dim_migration "
+                "(migration_id, migration_key_id, request_id, migration_time, project_id, migration_message) VALUES "
+                f"((SELECT COALESCE(MAX(migration_id), 0) + 1 FROM {TABLE_PREFIX}t_mig_dim_migration), "
+                f"(SELECT migration_key_id FROM {TABLE_PREFIX}t_mig_dim_request WHERE request_id = {request_id}), "
+                f"{request_id}, CURRENT_TIMESTAMP, {arms_project_id}, {_sql_literal(message)});"
+            ),
+            project_id=PROJECT_ID,
+        )
+        import_package._insert_comment(
+            db_instance, PROJECT_ID, request_id, message,
+            comment_table=f"{TABLE_PREFIX}t_mig_comments",
+        )
+    except Exception as writeback_exc:
+        print(f"Failed to persist the failure message to the database: {writeback_exc}")
+
+
+def main(connection_data: dict | None = None) -> int:
+    api_token = ""
+    if connection_data is None:
+        api_token = (API_TOKEN or getpass("Strategy API token: ")).strip()
+        if not api_token:
+            raise ValueError("A Strategy API token is required.")
     print("Connecting to environment...")
-    myConn = Connection(BASE_URL, MSTR_USERNAME, MSTR_PASSWORD, project_id=PROJECT_ID)
+    if connection_data is not None:
+        myConn = get_connection(connection_data=connection_data, project_id=PROJECT_ID)
+        if myConn is None:
+            raise RuntimeError("Unable to establish the Workstation connection. Check the selected environment and session.")
+    else:
+        myConn = Connection(BASE_URL, api_token=api_token, login_mode=4096, project_id=PROJECT_ID)
     db_instance = DatasourceInstance(connection=myConn, id=DATASOURCE_INSTANCE_ID)
 
     request_list = Report(connection=myConn, id=REQUEST_REPORT_ID)
@@ -565,10 +609,18 @@ def main() -> int:
     source_project_name = str(df['Project@Name'].iloc[0]).strip()
     source_project_id = str(df['Project@ID'].iloc[0]).strip()
 
-    if re.fullmatch(r"[0-9A-Fa-f]{32}", source_project_id):
-        source_project_conn = Connection(BASE_URL, MSTR_USERNAME, MSTR_PASSWORD, project_id=source_project_id)
+    if connection_data is not None:
+        if re.fullmatch(r"[0-9A-Fa-f]{32}", source_project_id):
+            source_project_conn = get_connection(connection_data=connection_data, project_id=source_project_id)
+        else:
+            source_project_conn = get_connection(connection_data=connection_data, project_name=source_project_name)
+        if source_project_conn is None:
+            myConn.close()
+            raise RuntimeError(f"Unable to establish the Workstation source-project connection for '{source_project_name}'.")
+    elif re.fullmatch(r"[0-9A-Fa-f]{32}", source_project_id):
+        source_project_conn = Connection(BASE_URL, api_token=api_token, login_mode=4096, project_id=source_project_id)
     else:
-        source_project_conn = Connection(BASE_URL, MSTR_USERNAME, MSTR_PASSWORD, project_name=source_project_name)
+        source_project_conn = Connection(BASE_URL, api_token=api_token, login_mode=4096, project_name=source_project_name)
 
     myPackageSettings = PackageSettings(
         Action.REPLACE,
@@ -585,6 +637,11 @@ def main() -> int:
         f"  Request ID: {request_id}\n"
         f"  Source project: {project_name}\n"
         f"  Shortcut path: {shortcut_path}"
+    )
+    print(f"SQL: setting request status to {IN_PROGRESS_STATUS_ID} (In Progress)")
+    db_instance.execute_query(
+        query=f"update {TABLE_PREFIX}t_mig_dim_request set status_id={IN_PROGRESS_STATUS_ID} where request_id={request_id};",
+        project_id=PROJECT_ID,
     )
     shortcuts4Migration = Folder(source_project_conn, id=_resolve_folder_id(source_project_conn, shortcut_path, project_name)).get_contents()
 
@@ -693,23 +750,53 @@ def main() -> int:
 
     timestamp = datetime.now().strftime('%Y%m%d%H%M%S')
     package_name = f"Req_{df['Request@ID'].iloc[0]}_{df['Migration Obj@Name'].iloc[0]}_{timestamp}"
-    Migration.create_object_migration(source_project_conn, toc_view=myPackageConfig, name=package_name, project_name=df['Project@Name'].iloc[0])
+    target_project_name = str(df['Target Project@NAME'].iloc[0]).strip() if 'Target Project@NAME' in df.columns else ""
+    if target_project_name.lower() in ("nan", "none"):
+        target_project_name = ""
+
+    try:
+        Migration.create_object_migration(source_project_conn, toc_view=myPackageConfig, name=package_name, project_name=df['Project@Name'].iloc[0])
+    except Exception as exc:
+        _record_package_failure(db_instance, request_id, target_project_name, str(exc))
+        raise
 
     print("SQL: clearing existing migration objects")
-    db_instance.execute_query(query=f"delete from arms.t_mig_dim_objects where migration_key_id=(select migration_key_id from arms.t_mig_dim_request where request_id={df['Request@ID'].iloc[0]});", project_id=PROJECT_ID)
+    db_instance.execute_query(query=f"delete from {TABLE_PREFIX}t_mig_dim_objects where migration_key_id=(select migration_key_id from {TABLE_PREFIX}t_mig_dim_request where request_id={df['Request@ID'].iloc[0]});", project_id=PROJECT_ID)
     sql_queries_insert_objects = _build_object_insert_queries(objects4Migration_properties, request_id)
     print("SQL: inserting migration objects")
     db_instance.execute_query(query="\n".join(sql_queries_insert_objects), project_id=PROJECT_ID)
 
     current_migration = Migration(source_project_conn, name=package_name)
     migration_id = current_migration.id
-    sql_query_insert_comment = f"INSERT INTO arms.t_mig_comments(comment_id,request_id,comment_text,comment_time,comment_author,human_flag) VALUES ((select max (comment_id) + 1 from arms.t_mig_comments),{df['Request@ID'].iloc[0]},'Package Created with mstrio',current_timestamp,'system',0);"
-    sql_query_upd_req_table = f"update arms.t_mig_dim_request set status_id=2 where request_id={df['Request@ID'].iloc[0]};"
-    sql_query_insert_migration = f"Update arms.t_mig_lu_migration_obj set migration_obj_id='{migration_id}',migration_obj_cre_time=current_timestamp WHERE migration_key_id=(select migration_key_id from arms.t_mig_dim_request where request_id={df['Request@ID'].iloc[0]});"
+    sql_query_insert_comment = f"INSERT INTO {TABLE_PREFIX}t_mig_comments(comment_id,request_id,comment_text,comment_time,comment_author,human_flag) VALUES ((select max (comment_id) + 1 from {TABLE_PREFIX}t_mig_comments),{df['Request@ID'].iloc[0]},'Package Created with mstrio',current_timestamp,'system',0);"
+    sql_query_upd_req_table = f"update {TABLE_PREFIX}t_mig_dim_request set status_id=5 where request_id={df['Request@ID'].iloc[0]};"
+    sql_query_insert_migration = f"Update {TABLE_PREFIX}t_mig_lu_migration_obj set migration_obj_id='{migration_id}',migration_obj_cre_time=current_timestamp WHERE migration_key_id=(select migration_key_id from {TABLE_PREFIX}t_mig_dim_request where request_id={df['Request@ID'].iloc[0]});"
+    print("SQL: updating  migration package ID")
+    db_instance.execute_query(query=sql_query_insert_migration, project_id=PROJECT_ID)
+
+    if target_project_name:
+        target_conn = None
+        try:
+            if connection_data is not None:
+                target_conn = get_connection(connection_data=connection_data, project_name=target_project_name)
+            else:
+                target_conn = Connection(TARGET_ENV_URL, api_token=api_token, login_mode=4096, project_name=target_project_name)
+            if target_conn is None:
+                raise RuntimeError(f"Unable to establish the Workstation target-project connection for '{target_project_name}'.")
+            import_package._validate_before_import(
+                current_migration, target_env=target_conn, target_project_name=target_project_name,
+            )
+        except Exception as exc:
+            _record_package_failure(db_instance, request_id, target_project_name, str(exc))
+            raise
+        finally:
+            if target_conn is not None and hasattr(target_conn, "close"):
+                target_conn.close()
+    else:
+        print("No 'Target Project@NAME' in the request report; target validation skipped.")
+
     print("SQL: recording package creation comment")
     db_instance.execute_query(query=sql_query_insert_comment, project_id=PROJECT_ID)
-    print("SQL: updating migration package ID")
-    db_instance.execute_query(query=sql_query_insert_migration, project_id=PROJECT_ID)
     print("SQL: updating request status")
     db_instance.execute_query(query=sql_query_upd_req_table, project_id=PROJECT_ID)
 
@@ -720,4 +807,10 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    if "connectionData" in globals():
+        workstation_connection_data = globals()["connectionData"]
+        if not isinstance(workstation_connection_data, dict):
+            raise ValueError("Workstation connectionData must be a dictionary.")
+        main(connection_data=workstation_connection_data)
+    else:
+        raise SystemExit(main())

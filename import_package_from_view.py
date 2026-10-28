@@ -3,15 +3,24 @@
 from __future__ import annotations
 
 from datetime import datetime
+from getpass import getpass
 from time import monotonic, sleep
 
 import import_package as app
 
+try:
+    import config_local as _local_config
+except ImportError:
+    _local_config = None
 
-INPUT_VIEW = "arms.v_mig_import_input"
+
+TABLE_PREFIX = "arms."
+INPUT_VIEW = "v_mig_import_input"
+API_TOKEN = getattr(_local_config, "API_TOKEN", "")
 ROLLBACK_REQUEST_STATUS = 18
 ROLLBACK_SUCCESS_STATUS = 19
 ROLLBACK_FAILED_STATUS = 11
+IN_PROGRESS_STATUS = 17
 INPUT_COLUMNS = (
     "request_id", "request_status_id", "source_project_name", "migration_key_id",
     "migration_obj_id", "tgt_env_id", "target_env_url", "target_project_name",
@@ -19,7 +28,7 @@ INPUT_COLUMNS = (
     "resolution_failed_status_id", "latest_migration_id", "resolution_error", "is_ready",
 )
 RESOLUTION_FAILURE_COMMENT = (
-    "Unable to resolve matchine Target Project name. "
+    "Unable to resolve matching Target Project name. "
     "Please check Environment/Status/Project mapping."
 )
 
@@ -61,7 +70,7 @@ def _execute(datasource: app.DatasourceInstance, query: str) -> dict:
 def _fetch_inputs(datasource: app.DatasourceInstance) -> list[dict[str, object]]:
     result = _execute(
         datasource,
-        f"SELECT {', '.join(INPUT_COLUMNS)} FROM {INPUT_VIEW} ORDER BY request_id DESC;",
+        f"SELECT {', '.join(INPUT_COLUMNS)} FROM {TABLE_PREFIX}{INPUT_VIEW} ORDER BY request_id DESC;",
     )
     rows = [
         {app._normalize_lookup_key(key): value for key, value in row.items()}
@@ -70,7 +79,7 @@ def _fetch_inputs(datasource: app.DatasourceInstance) -> list[dict[str, object]]
     for row in rows:
         missing = set(INPUT_COLUMNS) - row.keys()
         if missing:
-            raise ValueError(f"{INPUT_VIEW} is missing required columns: {', '.join(sorted(missing))}.")
+            raise ValueError(f"{TABLE_PREFIX}{INPUT_VIEW} is missing required columns: {', '.join(sorted(missing))}.")
     return rows
 
 
@@ -88,15 +97,16 @@ def _record_resolution_failure(
         )
         app._insert_comment(
             datasource, app.PROJECT_ID, request_id, RESOLUTION_FAILURE_COMMENT,
+            comment_table=f"{TABLE_PREFIX}t_mig_comments",
         )
         _execute(
             datasource,
-            f"UPDATE {app.REQUEST_TABLE} SET status_id={failed_status} WHERE request_id={request_id};",
+            f"UPDATE {TABLE_PREFIX}t_mig_dim_request SET status_id={failed_status} WHERE request_id={request_id};",
         )
         if latest_id is not None:
             _execute(
                 datasource,
-                f"UPDATE arms.t_mig_dim_migration SET status_id={failed_status} "
+                f"UPDATE {TABLE_PREFIX}t_mig_dim_migration SET status_id={failed_status} "
                 f"WHERE request_id={request_id} AND migration_id={latest_id};",
             )
         print(f"Set request {request_id} and its cached latest migration, if present, to status_id={failed_status}.")
@@ -116,15 +126,16 @@ def _insert_history(
     message_value = f", {app._sql_literal(migration_message)}" if migration_message is not None else ""
     _execute(
         datasource,
-        "INSERT INTO arms.t_mig_dim_migration "
+        f"INSERT INTO {TABLE_PREFIX}t_mig_dim_migration "
         f"(migration_id, migration_key_id, request_id, migration_time, project_id, status_id{message_column}) "
-        "VALUES ((SELECT COALESCE(MAX(migration_id), 0) + 1 FROM arms.t_mig_dim_migration), "
+        f"VALUES ((SELECT COALESCE(MAX(migration_id), 0) + 1 FROM {TABLE_PREFIX}t_mig_dim_migration), "
         f"{migration_key_id}, {request_id}, CURRENT_TIMESTAMP, {target_project_id}, {status_id}{message_value});",
     )
 
 
 def _import_request(
     source: app.Connection, datasource: app.DatasourceInstance, row: dict[str, object],
+    *, api_token: str,
 ) -> int:
     request_id = _integer(row, "request_id")
     migration_obj_id = _required_text(row, "migration_obj_id")
@@ -159,19 +170,28 @@ def _import_request(
         f"  Migration object GUID: {migration_obj_id}\n"
         f"  Request status ID: {request_status}"
     )
+    print(f"Setting request {request_id} status to {IN_PROGRESS_STATUS} (In Progress).")
+    _execute(
+        datasource,
+        f"UPDATE {TABLE_PREFIX}t_mig_dim_request SET status_id={IN_PROGRESS_STATUS} WHERE request_id={request_id};",
+    )
     target = None
     try:
         try:
             target = app.Connection(
-                target_url, app.MSTR_USERNAME, app.MSTR_PASSWORD, project_name=target_name,
+                target_url, api_token=api_token, login_mode=4096, project_name=target_name,
             )
             migration = app.Migration(source, id=migration_obj_id)
             app._list_active_migration_jobs(source, migration_obj_id, limit=20)
+            app._validate_before_import(
+                migration, target_env=target, target_project_name=target_name,
+                poll_seconds=app.POST_IMPORT_POLL_SECONDS,
+            )
 
             def record_reused_migration(reused: app.Migration) -> None:
                 _execute(
                     datasource,
-                    f"UPDATE {app.MIGRATION_OBJECT_TABLE} "
+                    f"UPDATE {TABLE_PREFIX}t_mig_lu_migration_obj "
                     f"SET migration_obj_id={app._sql_literal(reused.id)}, "
                     "migration_obj_cre_time=CURRENT_TIMESTAMP "
                     f"WHERE migration_key_id={migration_key_id};",
@@ -186,17 +206,15 @@ def _import_request(
             status = app._wait_for_migration_completion(active)
             print(f"Migration import status final value: {getattr(status, 'name', str(status))}")
             if status != app.ImportStatus.IMPORTED:
+                server_detail = str(getattr(getattr(active, "import_info", None), "message", "") or "").strip()
                 raise RuntimeError(
                     f"Migration did not complete a successful import: {getattr(status, 'name', str(status))}."
+                    + (f" Server message: {server_detail}" if server_detail else "")
                 )
             app._wait_for_post_import_readiness(
                 active, poll_seconds=app.POST_IMPORT_POLL_SECONDS,
                 timeout_seconds=app.POST_IMPORT_TIMEOUT_SECONDS,
                 require_unlocked_package=app.REQUIRE_UNLOCKED_PACKAGE_AFTER_IMPORT,
-            )
-            app._ensure_undo_request_not_pending(
-                active, target_connection=target,
-                require_requested=app.REQUIRE_UNDO_REQUESTED_AFTER_IMPORT,
             )
         except Exception as exc:
             message = f"Migration failed for request {request_id} on target environment '{target_env_name}': {exc}"
@@ -204,14 +222,17 @@ def _import_request(
             try:
                 _execute(
                     datasource,
-                    f"UPDATE {app.REQUEST_TABLE} SET status_id={failed_status} WHERE request_id={request_id};",
+                    f"UPDATE {TABLE_PREFIX}t_mig_dim_request SET status_id={failed_status} WHERE request_id={request_id};",
                 )
                 _insert_history(
                     datasource, request_id=request_id, migration_key_id=migration_key_id,
                     target_project_id=target_project_id, status_id=failed_status,
                     migration_message=message,
                 )
-                app._insert_comment(datasource, app.PROJECT_ID, request_id, message)
+                app._insert_comment(
+                    datasource, app.PROJECT_ID, request_id, message,
+                    comment_table=f"{TABLE_PREFIX}t_mig_comments",
+                )
             except Exception as writeback_exc:
                 raise RuntimeError(
                     f"{message}\nFailed to persist failure status/history/comment: {writeback_exc}"
@@ -227,10 +248,11 @@ def _import_request(
             datasource, app.PROJECT_ID, request_id,
             f"Migration completed successfully for request {request_id}. "
             f"Imported into target project '{target_name}' on environment '{target_env_name}'.",
+            comment_table=f"{TABLE_PREFIX}t_mig_comments",
         )
         _execute(
             datasource,
-            f"UPDATE {app.REQUEST_TABLE} SET status_id={success_status} WHERE request_id={request_id};",
+            f"UPDATE {TABLE_PREFIX}t_mig_dim_request SET status_id={success_status} WHERE request_id={request_id};",
         )
         return 0
     finally:
@@ -292,14 +314,17 @@ def _record_reverse_result(
     if latest_id is not None:
         _execute(
             datasource,
-            f"UPDATE arms.t_mig_dim_migration SET status_id={status}, "
+            f"UPDATE {TABLE_PREFIX}t_mig_dim_migration SET status_id={status}, "
             f"migration_message={app._sql_literal(message)} "
             f"WHERE request_id={request_id} AND migration_id={_integer(row, 'latest_migration_id')};",
         )
-    app._insert_comment(datasource, app.PROJECT_ID, request_id, message)
+    app._insert_comment(
+        datasource, app.PROJECT_ID, request_id, message,
+        comment_table=f"{TABLE_PREFIX}t_mig_comments",
+    )
     _execute(
         datasource,
-        f"UPDATE {app.REQUEST_TABLE} SET status_id={status} WHERE request_id={request_id};",
+        f"UPDATE {TABLE_PREFIX}t_mig_dim_request SET status_id={status} WHERE request_id={request_id};",
     )
 
 
@@ -315,14 +340,19 @@ def _record_reverse_success(datasource: app.DatasourceInstance, row: dict[str, o
         status_id=ROLLBACK_SUCCESS_STATUS,
         migration_message=message,
     )
-    app._insert_comment(datasource, app.PROJECT_ID, request_id, message)
+    app._insert_comment(
+        datasource, app.PROJECT_ID, request_id, message,
+        comment_table=f"{TABLE_PREFIX}t_mig_comments",
+    )
     _execute(
         datasource,
-        f"UPDATE {app.REQUEST_TABLE} SET status_id={ROLLBACK_SUCCESS_STATUS} WHERE request_id={request_id};",
+        f"UPDATE {TABLE_PREFIX}t_mig_dim_request SET status_id={ROLLBACK_SUCCESS_STATUS} WHERE request_id={request_id};",
     )
 
 
-def _reverse_request(datasource: app.DatasourceInstance, row: dict[str, object]) -> int:
+def _reverse_request(
+    datasource: app.DatasourceInstance, row: dict[str, object], *, api_token: str,
+) -> int:
     request_id = _integer(row, "request_id")
     target = None
     try:
@@ -337,7 +367,7 @@ def _reverse_request(datasource: app.DatasourceInstance, row: dict[str, object])
                 app.BASE_URL, app.SOURCE_ENVIRONMENT, target_env, app.ENVIRONMENT_URLS,
             )
             target = app.Connection(
-                url, app.MSTR_USERNAME, app.MSTR_PASSWORD, project_name=target_name,
+                url, api_token=api_token, login_mode=4096, project_name=target_name,
             )
             migration = app.Migration(target, id=migration_obj_id)
             print(f"Reversing migration {latest_id} ({migration_obj_id}) for request {request_id}.")
@@ -363,9 +393,12 @@ def _reverse_request(datasource: app.DatasourceInstance, row: dict[str, object])
 
 
 def main() -> int:
+    api_token = (API_TOKEN or getpass("Strategy API token: ")).strip()
+    if not api_token:
+        raise ValueError("A Strategy API token is required.")
     print("Connecting to environment...")
     source = app.Connection(
-        app.BASE_URL, app.MSTR_USERNAME, app.MSTR_PASSWORD, project_id=app.PROJECT_ID,
+        app.BASE_URL, api_token=api_token, login_mode=4096, project_id=app.PROJECT_ID,
     )
     try:
         datasource = app.DatasourceInstance(connection=source, id=app.DATASOURCE_INSTANCE_ID)
@@ -376,11 +409,11 @@ def main() -> int:
         for row in rows:
             request_id = _integer(row, "request_id")
             if _integer(row, "request_status_id") == ROLLBACK_REQUEST_STATUS:
-                return _reverse_request(datasource, row)
+                return _reverse_request(datasource, row, api_token=api_token)
             if _text(row, "migration_obj_id") is None:
                 print(f"Skipping request {request_id}: no migration object GUID. Create its package before importing.")
                 continue
-            return _import_request(source, datasource, row)
+            return _import_request(source, datasource, row, api_token=api_token)
         print("No matching requests have a migration package available to import.")
         return 0
     finally:

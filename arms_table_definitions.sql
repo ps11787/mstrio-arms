@@ -1,4 +1,4 @@
--- PostgreSQL arms schema: 25 table definitions, constraints and indexes.
+-- PostgreSQL arms schema: 26 table definitions, constraints and indexes.
 -- Reference extract, not a full backup or ordered restore script.
 -- Ownership, grants, triggers, policies, sequences and custom types are not included.
 -- "arms"."t_mig_comments"
@@ -116,6 +116,22 @@ CREATE TABLE "arms"."t_mig_lu_migration_obj" (
     "request_id" integer,
     "content_path" character varying,
     "migration_key_id" integer
+);
+
+-- "arms"."t_mig_lu_object_type"
+-- Populated by arms_object_type_lookup.sql; joins to t_mig_dim_objects.type.
+CREATE TABLE "arms"."t_mig_lu_object_type" (
+    "object_type_name" character varying(100) NOT NULL,
+    "object_type_id" integer NOT NULL,
+    "object_type_desc" character varying(255) NOT NULL,
+    "main_type_id" integer NOT NULL,
+    "main_type_name" character varying(100) NOT NULL,
+    "main_type_desc" character varying(255) NOT NULL,
+    "subtype_flag" smallint NOT NULL DEFAULT 0,
+    "required_dependency_flag" smallint NOT NULL DEFAULT 0,
+    "schema_flag" smallint NOT NULL DEFAULT 0,
+    "sort_id" integer,
+    CONSTRAINT "pk_t_mig_lu_object_type" PRIMARY KEY ("object_type_name")
 );
 
 -- "arms"."t_mig_lu_package"

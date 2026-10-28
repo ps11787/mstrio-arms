@@ -1,8 +1,14 @@
 # Import Package Script
 
-Set `MSTR_PASSWORD` in the execution environment before running the import,
-package-creation, or project-sync scripts; these scripts no longer supply a
-hard-coded password default.
+Settings (URLs, IDs, table names, timeouts, flags) are plain variables at the top of
+[import_package.py](../import_package.py); environment variables are not read.
+Edit the values there before running. Target environment URLs are set with
+`TEST_URL`, `QA_URL` and `PROD_URL`.
+
+Secrets (`API_TOKEN`, `MSTR_USERNAME`, `MSTR_PASSWORD`) are read from a local,
+git-ignored `config_local.py`. Copy [config_local.example.py](../config_local.example.py)
+to `config_local.py` and fill in the values. Without that file the secrets are empty and
+the API-token scripts prompt for a token at startup.
 
 This document explains the workflow of [import_package.py](../import_package.py) and how it relates to [create_package_validation_loop.py](../create_package_validation_loop.py).
 
@@ -22,6 +28,31 @@ In short:
 ## Workflow
 
 ### View-based entry point
+
+Normal imports follow the Migrate/Reuse lifecycle: migrate to the selected target
+with `generate_undo=True`; if rebinding fails because the package is locked, reuse
+the package in a new target-bound migration and save its reference before starting
+it. The original migration is not deleted. Import completion and undo-package
+availability are checked, but normal imports never request or approve reverse.
+Only status `18` triggers reverse. Existing pending reverse requests are not
+cleared automatically.
+
+An imported package may remain locked under the server's lifecycle; this is
+separate from a reverse request. The default readiness check accepts successful
+import plus an available undo package even if locked. Reuse handles a subsequent
+locked-package import instead of deleting the old migration or forcing unlock.
+The original non-view entry point retains its existing post-import undo-request
+behavior; this change applies only to the view-based entry point.
+
+The view-based entry point uses API-token authentication (`login_mode=4096`)
+for the initial connection and all import/reverse target connections. `API_TOKEN`
+near the top defaults to empty; a hidden startup prompt obtains the token once
+when empty. Username/password settings from the original module are not used for
+these connections, and there is no password fallback. The same token is used for
+each connection, so every destination must accept it and support API-token login.
+Do not commit real tokens. Server-side “Invalid authentication mode” errors still
+require deployment configuration/support checks; this change cannot enable that
+mode on the server.
 
 #### Reverse requests (status 18)
 
@@ -52,13 +83,21 @@ earlier attempt is chosen. Undo must be available on that migration object.
 Do not run concurrent workers that modify these cached request/history mappings.
 
 [import_package_from_view.py](../import_package_from_view.py) is an alternative
-entry point. The original [import_package.py](../import_package.py) remains
-unchanged and supplies shared configuration and migration helpers; keep both
+entry point. The original [import_package.py](../import_package.py)
+supplies shared configuration and migration helpers; keep both
 files together. Run the alternative with:
 
 ```powershell
 .\.venv\Scripts\python.exe .\import_package_from_view.py
 ```
+
+Set `TABLE_PREFIX = "arms."` near the top of the alternative entry point to
+configure its database prefix, including the trailing dot. This applies to the
+input view, request and migration updates, history inserts, comments, and ID
+subqueries for import and rollback. Set it to `""` for unqualified names.
+`INPUT_VIEW` contains only the unqualified view name. This entry point uses its
+own prefix rather than `import_package.py`'s request/migration table settings;
+the original entry point keeps its existing defaults.
 
 It fetches the 15 view columns once into a list, newest first, and processes the
 first request with a migration reference, just like the original selection.
@@ -135,7 +174,7 @@ measurement against the production workload.
 The script follows these steps:
 
 1. Connect to the source environment through `Connection`.
-2. Query requests in `MSTR_REQUEST_STATUS_FILTER`, newest request first, using SQL.
+2. Query requests in `REQUEST_STATUS_FILTER`, newest request first, using SQL.
 3. Join `arms.t_mig_dim_request.project_id` to `arms.t_mig_lu_project.project_id`
    to retrieve `project_name AS source_project_name`. A left join preserves
    requests with missing source mappings so resolution errors can be recorded.
@@ -178,8 +217,7 @@ If `Migration Obj@GUID` is empty, the script raises `ValueError`. The import can
 ### Target project resolution
 
 `FORCE_STATUS_TARGET_PROJECT_RESOLUTION` near the beginning of the script defaults to
-`True`. It can also be configured with the environment variable
-`MSTR_FORCE_STATUS_TARGET_PROJECT_RESOLUTION` (`true` or `false`).
+`True`; change the variable to `False` to allow legacy fallbacks.
 
 When enabled:
 
@@ -217,7 +255,7 @@ Result writeback still uses the target environment's `status_id_success` and
 Request/report target names, request target-project IDs, and derived
 names cannot override this mapping. For both successful and failed attempts,
 `t_mig_dim_migration.project_id` is the numeric `tgt_project_id` from
-`arms.t_mig_lu_tgt_project` (or `MSTR_TARGET_PROJECT_TABLE`). It is looked up by
+`arms.t_mig_lu_tgt_project` (variable `TARGET_PROJECT_TABLE`). It is looked up by
 the resolved destination project name, not taken from the request, the source
 project table, or a MicroStrategy GUID. Missing, invalid, or ambiguous target
 keys stop the workflow before import; history inserts cannot silently use `NULL`.
@@ -236,6 +274,25 @@ the selected `arms.t_mig_lu_tgt_env` row. They are validated before opening the
 target connection or starting import. Missing environment mappings or invalid
 status IDs stop the workflow; the script does not guess from status names or use
 the target-project table's `status_id`.
+
+### Request set to In Progress
+
+After the request is read from the input view and its fields are resolved,
+`import_package_from_view.py` sets `t_mig_dim_request.status_id` to `17` (In Progress,
+`IN_PROGRESS_STATUS`) before connecting to the target. The status then moves to the
+environment's success or failed status at the end of the import. Rollback requests
+(status 18) are not changed.
+
+### Pre-import validation failure
+
+Before `migrate()`, both import scripts call `trigger_validation` against the target project and
+poll `migration.validation` (timeout `POST_IMPORT_TIMEOUT_SECONDS`). On `VALIDATION_FAILED`
+the verbatim server message (including missing-dependency object GUIDs) is printed and raised, so
+it is saved to the request status, `migration_message` and `t_mig_comments` through the standard
+failure path below; the import is not started. On `VALIDATED` the import proceeds normally.
+If the package is locked (`packageInfo.status is 'locked'`), the server rejects validation, so
+it is skipped with a printed notice and the locked-package reuse import path takes over.
+Async `IMPORT_FAILED` results now also append the server's `import_info.message`.
 
 ### Import failure during `migrate()`
 
@@ -272,7 +329,7 @@ The create request uses the SDK's `unlockOnStart=True` default.
 
 Before starting the reused import, the script writes the new ID to `migration_obj_id`
 and refreshes `migration_obj_cre_time`
-to `arms.t_mig_lu_migration_obj` (or `MSTR_MIGRATION_OBJECT_TABLE`) using the selected
+to `arms.t_mig_lu_migration_obj` (variable `MIGRATION_OBJECT_TABLE`) using the selected
 request's `migration_key_id`. If that write fails, import is not started. The
 new instance's saved binding is verified before sending the import request with
 the selected project's header. Polling and post-import checks use the new instance.
@@ -290,7 +347,7 @@ Composite migration IDs (`package:import`) are not sent as object-GUID filters t
 the job monitor, which rejects them. Skipping that diagnostic means job state is
 unknown, not that no jobs exist.
 
-Import polling uses `MSTR_POST_IMPORT_TIMEOUT_SECONDS` as its timeout. Status-fetch
+Import polling uses `POST_IMPORT_TIMEOUT_SECONDS` as its timeout. Status-fetch
 errors and timeouts propagate into failure writeback instead of being ignored.
 
 ### Database update failure after import

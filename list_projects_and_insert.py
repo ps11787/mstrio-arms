@@ -20,10 +20,15 @@ from mstrio.connection import Connection
 from mstrio.datasources.datasource_instance import DatasourceInstance
 from mstrio.server.project import list_projects
 
+try:
+    import config_local as _local_config
+except ImportError:
+    _local_config = None
+
 
 DEFAULT_BASE_URL = "https://env-371825.ma.cloud.microstrategy.com/MicroStrategyLibrary"
-DEFAULT_USERNAME = "mstr"
-DEFAULT_PASSWORD = "EW85AcqE1SoT"
+DEFAULT_USERNAME = getattr(_local_config, "MSTR_USERNAME", "mstr")
+DEFAULT_PASSWORD = getattr(_local_config, "MSTR_PASSWORD", "")
 DEFAULT_LOGIN_MODE = 1
 DEFAULT_DATASOURCE_NAME = "ARMS_WH"
 DEFAULT_TABLE_NAME = "arms.t_mig_lu_project"

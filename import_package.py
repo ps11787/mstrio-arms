@@ -6,7 +6,6 @@ error-handling documentation.
 
 from __future__ import annotations
 
-import os
 from collections.abc import Callable
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
@@ -16,80 +15,45 @@ import mstrio.api.migration as migration_api
 from mstrio.connection import Connection
 from mstrio.datasources.datasource_instance import DatasourceInstance
 from mstrio.object_management.migration import Migration
-from mstrio.object_management.migration.package import ImportStatus, PackageStatus
+from mstrio.object_management.migration.package import ImportStatus, PackageStatus, ValidationStatus
 from mstrio.server.job_monitor import list_jobs
 
+try:
+    import config_local as _local_config
+except ImportError:
+    _local_config = None
 
-BASE_URL = os.getenv("MSTR_BASE_URL", "https://env-371825.ma.cloud.microstrategy.com/MicroStrategyLibrary")
-SOURCE_ENVIRONMENT = os.getenv("MSTR_SOURCE_ENVIRONMENT", "dev")
+
+BASE_URL = "https://env-371825.ma.cloud.microstrategy.com/MicroStrategyLibrary"
+SOURCE_ENVIRONMENT = "dev"
+# Target environment URLs keyed by tgt_env_id; empty values are ignored.
+TEST_URL = ""
+QA_URL = ""
+PROD_URL = ""
 ENVIRONMENT_URLS = {
-    "dev": BASE_URL,
-    # Example mapping for future environments. Keep this configurable so the
-    # target environment URL can be changed without editing the logic itself.
-    # "test": "https://env-xxxx.ma.cloud.microstrategy.com/MicroStrategyLibrary",
-    # "qa": "https://env-yyyy.ma.cloud.microstrategy.com/MicroStrategyLibrary",
-}
-ENVIRONMENT_URLS.update({
-    key.strip().lower(): value.strip()
-    for key, value in {
-        "test": os.getenv("MSTR_TEST_URL", ""),
-        "qa": os.getenv("MSTR_QA_URL", ""),
-        "prod": os.getenv("MSTR_PROD_URL", ""),
-    }.items()
+    key: value.strip()
+    for key, value in {"dev": BASE_URL, "test": TEST_URL, "qa": QA_URL, "prod": PROD_URL}.items()
     if value and value.strip()
-})
-MSTR_USERNAME = os.getenv("MSTR_USERNAME", "mstr")
-MSTR_PASSWORD = os.getenv("MSTR_PASSWORD", "")
-PROJECT_ID = os.getenv("MSTR_PROJECT_ID", "4B0544627D49F8DA03C26D817D208263")
-DATASOURCE_INSTANCE_ID = os.getenv("MSTR_DATASOURCE_INSTANCE_ID", "A23BBC514D336D5B4FCE919FE19661A3")
-TARGET_PROJECT_TABLE = os.getenv("MSTR_TARGET_PROJECT_TABLE", "arms.t_mig_lu_tgt_project")
-STATUS_TABLE = os.getenv("MSTR_STATUS_TABLE", "arms.t_mig_lu_status")
-TARGET_ENV_TABLE = os.getenv("MSTR_TARGET_ENV_TABLE", "arms.t_mig_lu_tgt_env")
-REQUEST_TABLE = os.getenv("MSTR_REQUEST_TABLE", "arms.t_mig_dim_request")
-PROJECT_LOOKUP_TABLE = os.getenv("MSTR_PROJECT_LOOKUP_TABLE", "arms.t_mig_lu_project")
-MIGRATION_OBJECT_TABLE = os.getenv("MSTR_MIGRATION_OBJECT_TABLE", "arms.t_mig_lu_migration_obj")
+}
+MSTR_USERNAME = getattr(_local_config, "MSTR_USERNAME", "mstr")
+MSTR_PASSWORD = getattr(_local_config, "MSTR_PASSWORD", "")
+PROJECT_ID = "4B0544627D49F8DA03C26D817D208263"
+DATASOURCE_INSTANCE_ID = "A23BBC514D336D5B4FCE919FE19661A3"
+TARGET_PROJECT_TABLE = "arms.t_mig_lu_tgt_project"
+STATUS_TABLE = "arms.t_mig_lu_status"
+TARGET_ENV_TABLE = "arms.t_mig_lu_tgt_env"
+REQUEST_TABLE = "arms.t_mig_dim_request"
+PROJECT_LOOKUP_TABLE = "arms.t_mig_lu_project"
+MIGRATION_OBJECT_TABLE = "arms.t_mig_lu_migration_obj"
 TARGET_RESOLUTION_FAILED_STATUS_ID = 11
 # Require an unambiguous status/environment mapping; disable to allow legacy fallbacks.
-FORCE_STATUS_TARGET_PROJECT_RESOLUTION = os.getenv(
-    "MSTR_FORCE_STATUS_TARGET_PROJECT_RESOLUTION",
-    "true",
-).strip().lower() in {
-    "1",
-    "true",
-    "yes",
-    "y",
-}
-REQUEST_STATUS_FILTER = tuple(
-    int(item.strip())
-    for item in os.getenv("MSTR_REQUEST_STATUS_FILTER", "5,6,7").split(",")
-    if item.strip()
-)
-FORCE_UNLOCK_LOCKED_PACKAGE = os.getenv("MSTR_FORCE_UNLOCK_LOCKED_PACKAGE", "true").strip().lower() in {
-    "1",
-    "true",
-    "yes",
-    "y",
-}
-POST_IMPORT_POLL_SECONDS = int(os.getenv("MSTR_POST_IMPORT_POLL_SECONDS", "5"))
-POST_IMPORT_TIMEOUT_SECONDS = int(os.getenv("MSTR_POST_IMPORT_TIMEOUT_SECONDS", "600"))
-REQUIRE_UNLOCKED_PACKAGE_AFTER_IMPORT = os.getenv(
-    "MSTR_REQUIRE_UNLOCKED_PACKAGE_AFTER_IMPORT",
-    "false",
-).strip().lower() in {
-    "1",
-    "true",
-    "yes",
-    "y",
-}
-REQUIRE_UNDO_REQUESTED_AFTER_IMPORT = os.getenv(
-    "MSTR_REQUIRE_UNDO_REQUESTED_AFTER_IMPORT",
-    "true",
-).strip().lower() in {
-    "1",
-    "true",
-    "yes",
-    "y",
-}
+FORCE_STATUS_TARGET_PROJECT_RESOLUTION = True
+REQUEST_STATUS_FILTER = (5, 6, 7)
+FORCE_UNLOCK_LOCKED_PACKAGE = True
+POST_IMPORT_POLL_SECONDS = 5
+POST_IMPORT_TIMEOUT_SECONDS = 600
+REQUIRE_UNLOCKED_PACKAGE_AFTER_IMPORT = False
+REQUIRE_UNDO_REQUESTED_AFTER_IMPORT = True
 
 
 def _normalize_lookup_key(value: object) -> str:
@@ -803,14 +767,17 @@ def _resolve_target_arms_project_id(
     datasource: DatasourceInstance,
     query_project_id: str,
     target_project_name: str,
+    *,
+    target_project_table: str | None = None,
 ) -> int:
     """Resolve the target lookup's numeric key for the actual import destination."""
+    table = TARGET_PROJECT_TABLE if target_project_table is None else target_project_table
     name = target_project_name.strip()
     if not name:
         raise ValueError("Target project name is required to resolve tgt_project_id.")
     escaped_name = name.replace("'", "''")
     query = (
-        f"SELECT tgt_project_id FROM {TARGET_PROJECT_TABLE} "
+        f"SELECT tgt_project_id FROM {table} "
         f"WHERE LOWER(TRIM(tgt_project_name)) = LOWER('{escaped_name}');"
     )
     result = _execute_query(datasource, project_id=query_project_id, query=query)
@@ -821,12 +788,12 @@ def _resolve_target_arms_project_id(
             project_ids.add(_coerce_int(value))
         except ValueError as exc:
             raise ValueError(
-                f"Invalid tgt_project_id {value!r} in {TARGET_PROJECT_TABLE} "
+                f"Invalid tgt_project_id {value!r} in {table} "
                 f"for target project '{name}'."
             ) from exc
     if len(project_ids) != 1:
         raise ValueError(
-            f"Expected exactly one tgt_project_id in {TARGET_PROJECT_TABLE} "
+            f"Expected exactly one tgt_project_id in {table} "
             f"for target project '{name}'; found {len(project_ids)}: {sorted(project_ids)}."
         )
     return next(iter(project_ids))
@@ -900,15 +867,61 @@ def _insert_comment(
     request_id: object,
     comment_text: str,
     author: str = "system",
+    *,
+    comment_table: str = "arms.t_mig_comments",
 ) -> None:
     """Insert a new comment for the request using the ARMS comments table."""
     escaped_comment = comment_text.replace("'", "''")
     query = (
-        "INSERT INTO arms.t_mig_comments(comment_id,request_id,comment_text,comment_time,comment_author,human_flag) "
-        "VALUES ((SELECT COALESCE(MAX(comment_id), 0) + 1 FROM arms.t_mig_comments), "
+        f"INSERT INTO {comment_table}(comment_id,request_id,comment_text,comment_time,comment_author,human_flag) "
+        f"VALUES ((SELECT COALESCE(MAX(comment_id), 0) + 1 FROM {comment_table}), "
         f"{request_id}, '{escaped_comment}', CURRENT_TIMESTAMP, '{author}', 0);"
     )
     _execute_query(datasource, project_id=project_id, query=query)
+
+
+def _validate_before_import(
+    migration: Migration,
+    *,
+    target_env,
+    target_project_name: str,
+    poll_seconds: int = 5,
+    timeout_seconds: int = POST_IMPORT_TIMEOUT_SECONDS,
+) -> None:
+    """Validate the package against the target; raise with the server message on failure."""
+    print(f"Validating package against target project '{target_project_name}'...")
+    try:
+        migration.trigger_validation(target_env=target_env, target_project_name=target_project_name)
+    except Exception as exc:
+        if not _is_package_locked_error(exc):
+            raise
+        # A locked package rejects updates; the import reuses it via _migrate_with_lock_retry.
+        print(f"Validation skipped: package is locked ({exc}). Continuing with locked-package import.")
+        return
+    deadline_epoch = datetime.now().timestamp() + timeout_seconds
+    last_status = None
+
+    while True:
+        validation = migration.validation
+        status = getattr(validation, "status", None)
+        status_name = getattr(status, "name", str(status))
+        if status_name != last_status:
+            print(f"Validation status: {status_name} at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            last_status = status_name
+
+        if status == ValidationStatus.VALIDATED:
+            print("Validation succeeded.")
+            return
+        if status == ValidationStatus.VALIDATION_FAILED:
+            server_message = str(getattr(validation, "message", "") or "").strip() or "no message returned"
+            print(f"Validation failed: {server_message}")
+            raise RuntimeError(f"Package validation failed: {server_message}")
+
+        if datetime.now().timestamp() >= deadline_epoch:
+            raise TimeoutError(
+                f"Package validation timed out after {timeout_seconds}s; last status: {status_name}."
+            )
+        sleep(poll_seconds)
 
 
 def _wait_for_migration_completion(
@@ -1561,6 +1574,12 @@ def main() -> int:
             )
             current_migration = Migration(my_conn, id=migration_obj_guid)
             _list_active_migration_jobs(my_conn, migration_obj_guid, limit=20)
+            _validate_before_import(
+                current_migration,
+                target_env=target_env,
+                target_project_name=target_project_name,
+                poll_seconds=POST_IMPORT_POLL_SECONDS,
+            )
             print("Starting package import...")
             def record_reused_migration(reused_migration: Migration) -> None:
                 nonlocal active_migration
@@ -1594,9 +1613,11 @@ def main() -> int:
             import_status = _wait_for_migration_completion(active_migration)
             print(f"Migration import status final value: {getattr(import_status, 'name', str(import_status))}")
             if import_status != ImportStatus.IMPORTED:
+                server_detail = str(getattr(getattr(active_migration, "import_info", None), "message", "") or "").strip()
                 raise RuntimeError(
                     "Migration did not complete a successful import: "
                     f"{getattr(import_status, 'name', str(import_status))}."
+                    + (f" Server message: {server_detail}" if server_detail else "")
                 )
             _wait_for_post_import_readiness(
                 active_migration,

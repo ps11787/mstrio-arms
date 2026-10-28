@@ -762,6 +762,7 @@ def test_main_writes_environment_result_status(monkeypatch, outcome):
     monkeypatch.setattr(import_package, "_get_result_status_id_for_environment", result_status)
     monkeypatch.setattr(import_package, "_resolve_target_project_name_from_sql", lambda *args, **kwargs: "Q01 - Tutorial")
     monkeypatch.setattr(import_package, "_list_active_migration_jobs", lambda *args, **kwargs: [])
+    monkeypatch.setattr(import_package, "_validate_before_import", lambda *args, **kwargs: None)
     def migrate(*args, **kwargs):
         if outcome == "reuse_start_error":
             reused = type("Reused", (), {"id": "package:new-import", "name": "Reused"})()
@@ -962,3 +963,57 @@ def test_import_polling_times_out():
 
     with pytest.raises(TimeoutError, match="last status: RUNNING"):
         import_package._wait_for_migration_completion(FakeMigration(), timeout_seconds=0)
+
+
+def _fake_validating_migration(status, message=""):
+    class Fake:
+        calls = []
+
+        def trigger_validation(self, **kwargs):
+            self.calls.append(kwargs)
+
+        @property
+        def validation(self):
+            return type("V", (), {"status": status, "message": message})()
+
+    return Fake()
+
+
+def test_validate_before_import_passes_when_validated():
+    from mstrio.object_management.migration.package import ValidationStatus
+
+    fake = _fake_validating_migration(ValidationStatus.VALIDATED)
+    import_package._validate_before_import(fake, target_env="t", target_project_name="P", poll_seconds=0)
+    assert fake.calls == [{"target_env": "t", "target_project_name": "P"}]
+
+
+def test_validate_before_import_skips_locked_package(capsys):
+    class Locked:
+        def trigger_validation(self, **kwargs):
+            raise RuntimeError("Cannot do current operation for now when `packageInfo.status` is 'locked'.")
+
+        @property
+        def validation(self):
+            raise AssertionError("Locked packages must not be polled.")
+
+    import_package._validate_before_import(Locked(), target_env="t", target_project_name="P", poll_seconds=0)
+    assert "Validation skipped: package is locked" in capsys.readouterr().out
+
+
+def test_validate_before_import_propagates_other_trigger_errors():
+    class Broken:
+        def trigger_validation(self, **kwargs):
+            raise RuntimeError("Object: <Metric id=" + "E" * 32 + "> is not found")
+
+    with pytest.raises(RuntimeError, match="E" * 32):
+        import_package._validate_before_import(Broken(), target_env="t", target_project_name="P", poll_seconds=0)
+
+
+def test_validate_before_import_raises_server_message():
+    from mstrio.object_management.migration.package import ValidationStatus
+
+    message = "Object: <Metric id=" + "B" * 32 + "> is not found"
+    fake = _fake_validating_migration(ValidationStatus.VALIDATION_FAILED, message)
+    with pytest.raises(RuntimeError, match="B" * 32):
+        import_package._validate_before_import(fake, target_env="t", target_project_name="P", poll_seconds=0)
+

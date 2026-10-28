@@ -7,6 +7,7 @@ import import_package_from_view as script
 
 @pytest.fixture
 def runtime(monkeypatch):
+    monkeypatch.setattr(script, "API_TOKEN", "test-api-token")
     row = {
         "request_id": "13.0", "request_status_id": "5.0",
         "source_project_name": "E01 - Tutorial", "migration_key_id": "12.0",
@@ -19,10 +20,15 @@ def runtime(monkeypatch):
     state = SimpleNamespace(
         rows=[row], queries=[], connections=[], migrated=[], post_checks=[], reused=False,
         final_status=script.app.ImportStatus.IMPORTED, write_error=None,
-    )
+                validated=[], validation_error=None,
+            )
 
     class Connection:
         def __init__(self, *args, **kwargs):
+            assert len(args) == 1
+            assert kwargs["api_token"] == "test-api-token"
+            assert kwargs["login_mode"] == 4096
+            assert "username" not in kwargs and "password" not in kwargs
             self.args = args
             self.kwargs = kwargs
             self.closed = False
@@ -39,7 +45,7 @@ def runtime(monkeypatch):
             state.queries.append(query)
             if query.startswith("SELECT "):
                 assert len([q for q in state.queries if q.startswith("SELECT ")]) == 1
-                assert f"FROM {script.INPUT_VIEW} ORDER BY request_id DESC" in query
+                assert f"FROM {script.TABLE_PREFIX}{script.INPUT_VIEW} ORDER BY request_id DESC" in query
                 return {"results": {"data": {
                     column: [r[column] for r in state.rows] for column in script.INPUT_COLUMNS
                 }}}
@@ -57,17 +63,47 @@ def runtime(monkeypatch):
     monkeypatch.setattr(script.app, "DatasourceInstance", Datasource)
     monkeypatch.setattr(script.app, "Migration", lambda connection, id: SimpleNamespace(id=id))
     monkeypatch.setattr(script.app, "_list_active_migration_jobs", lambda *a, **kw: [])
+    def validate(migration, **kwargs):
+        state.validated.append(migration)
+        if state.validation_error:
+            raise RuntimeError(f"Package validation failed: {state.validation_error}")
+
+    monkeypatch.setattr(script.app, "_validate_before_import", validate)
     monkeypatch.setattr(script.app, "_migrate_with_lock_retry", migrate)
     monkeypatch.setattr(script.app, "_wait_for_migration_completion", lambda migration: state.final_status)
     monkeypatch.setattr(
         script.app, "_wait_for_post_import_readiness",
         lambda *a, **kw: state.post_checks.append("readiness"),
     )
-    monkeypatch.setattr(
-        script.app, "_ensure_undo_request_not_pending",
-        lambda *a, **kw: state.post_checks.append("undo"),
-    )
+    def unexpected_undo_request(*args, **kwargs):
+        pytest.fail("Normal imports must not submit a reverse request.")
+
+    monkeypatch.setattr(script.app, "_ensure_undo_request_not_pending", unexpected_undo_request)
+    monkeypatch.setattr(script.app.migration_api, "update_migration", unexpected_undo_request)
     return state
+
+
+def test_api_token_prompt_is_used_once_for_both_connections(runtime, monkeypatch):
+    monkeypatch.setattr(script, "API_TOKEN", "")
+    prompts = []
+
+    def prompt(message):
+        prompts.append(message)
+        return "  test-api-token  "
+
+    monkeypatch.setattr(script, "getpass", prompt)
+    assert script.main() == 0
+    assert len(prompts) == 1
+    assert len(runtime.connections) == 2
+
+
+def test_empty_api_token_is_rejected_before_connecting(runtime, monkeypatch):
+    monkeypatch.setattr(script, "API_TOKEN", "")
+    monkeypatch.setattr(script, "getpass", lambda message: " ")
+    with pytest.raises(ValueError, match="API token is required"):
+        script.main()
+    assert not runtime.connections
+    assert not runtime.queries
 
 
 def test_success_uses_one_view_read_and_cached_writeback_keys(runtime):
@@ -78,9 +114,36 @@ def test_success_uses_one_view_read_and_cached_writeback_keys(runtime):
     assert "SELECT migration_key_id" not in history
     assert "migration_message" not in history
     assert runtime.queries[-1].endswith("SET status_id=8 WHERE request_id=13;")
-    assert runtime.post_checks == ["readiness", "undo"]
+    assert runtime.post_checks == ["readiness"]
+    assert runtime.migrated[0][1]["generate_undo"] is True
     assert runtime.connections[1].kwargs["project_name"] == "T01 - Tutorial"
     assert all(connection.closed for connection in runtime.connections)
+
+
+def test_request_is_set_in_progress_before_import(runtime):
+    assert script.main() == 0
+    in_progress = runtime.queries.index("UPDATE arms.t_mig_dim_request SET status_id=17 WHERE request_id=13;")
+    assert in_progress == 1  # right after the single view read
+    assert runtime.queries[-1].endswith("SET status_id=8 WHERE request_id=13;")
+
+
+def test_validation_runs_before_import(runtime):
+    assert script.main() == 0
+    assert len(runtime.validated) == 1
+    assert len(runtime.migrated) == 1
+
+
+def test_validation_failure_records_server_message_and_skips_import(runtime):
+    guid = "A" * 32
+    runtime.validation_error = f"Object: <Metric id={guid}> is not found"
+    with pytest.raises(RuntimeError, match=guid):
+        script.main()
+    assert runtime.migrated == []
+    assert runtime.post_checks == []
+    history = next(q for q in runtime.queries if q.startswith("INSERT INTO arms.t_mig_dim_migration"))
+    comment = next(q for q in runtime.queries if q.startswith("INSERT INTO arms.t_mig_comments"))
+    assert guid in history and guid in comment
+    assert any("SET status_id=13 WHERE request_id=13" in q for q in runtime.queries)
 
 
 def test_empty_inputs_exit_cleanly(runtime, capsys):
@@ -89,6 +152,38 @@ def test_empty_inputs_exit_cleanly(runtime, capsys):
     assert "No requests found" in capsys.readouterr().out
     assert len(runtime.queries) == 1
     assert runtime.connections[0].closed
+
+
+@pytest.mark.parametrize("prefix", ["custom.", ""])
+@pytest.mark.parametrize("outcome", ["success", "failure", "mapping", "rollback_failure", "rollback_success"])
+def test_all_queries_use_configured_prefix(runtime, monkeypatch, prefix, outcome):
+    monkeypatch.setattr(script, "TABLE_PREFIX", prefix)
+    runtime.reused = True
+    row = runtime.rows[0]
+    if outcome == "failure":
+        runtime.final_status = script.app.ImportStatus.IMPORT_FAILED
+        with pytest.raises(RuntimeError, match="did not complete"):
+            script.main()
+    elif outcome == "mapping":
+        row.update(is_ready=0, resolution_error="No mapping")
+        with pytest.raises(ValueError, match="No mapping"):
+            script.main()
+    elif outcome == "rollback_failure":
+        row.update(request_status_id=18, is_ready=0, resolution_error="No mapping")
+        with pytest.raises(ValueError, match="No mapping"):
+            script.main()
+    elif outcome == "rollback_success":
+        script._record_reverse_success(script.app.DatasourceInstance(), row, "Rollback completed")
+    else:
+        assert script.main() == 0
+    assert runtime.queries
+    assert all("arms." not in query for query in runtime.queries)
+    assert any(f"INSERT INTO {prefix}t_mig_comments" in query for query in runtime.queries)
+    assert any(f"UPDATE {prefix}t_mig_dim_request" in query for query in runtime.queries)
+    if outcome in ("success", "failure", "rollback_success"):
+        assert any(f"INSERT INTO {prefix}t_mig_dim_migration" in query for query in runtime.queries)
+    else:
+        assert any(f"UPDATE {prefix}t_mig_dim_migration" in query for query in runtime.queries)
 
 
 def test_missing_migration_is_skipped_without_extra_queries(runtime, capsys):
@@ -165,6 +260,8 @@ def test_reuse_updates_cached_key_without_request_lookup(runtime):
     assert "'package:reused'" in update
     assert "WHERE migration_key_id=12;" in update
     assert "SELECT" not in update
+    assert runtime.migrated[0][1]["generate_undo"] is True
+    assert runtime.post_checks == ["readiness"]
 
 
 def test_url_falls_back_to_existing_configuration(runtime, monkeypatch):

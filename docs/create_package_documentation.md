@@ -2,13 +2,44 @@
 
 ## Creation-only workflow in create_package_validation_loop.py
 
+### Run from Workstation
+
+Import [create_package_validation_loop.py](../create_package_validation_loop.py)
+into Workstation's Python Scripts interface, select the environment containing
+the configured request report and datasource, and run it. Workstation supplies
+`connectionData`; the script uses `get_connection` for both the initial project
+and the report-selected source project. No API token or password is required in
+this mode. The selected Workstation environment overrides `BASE_URL`; configured
+project/report/datasource IDs must exist there. Connection errors stop the script
+without falling back to token authentication. Execution creates packages and
+performs the usual database writebacks, so use the intended environment.
+
+Outside Workstation, run the script normally to use the API-token flow below.
+
+Set `TABLE_PREFIX` near the top of the script to change the SQL table prefix
+(default `"arms."`, including the trailing dot). It applies to all creation
+writebacks, subqueries, and the failure-history target-project lookup. Use `""`
+for unqualified table names.
+
+This entry point uses Strategy API-token authentication (`login_mode=4096`) for
+both its initial connection and its source-project connection. `BASE_URL`,
+`PROJECT_ID`, `DATASOURCE_INSTANCE_ID`, and `REQUEST_REPORT_ID` are configured
+directly near the top; environment variables do not override those settings.
+`API_TOKEN` is read from the local, git-ignored `config_local.py` (copy
+[config_local.example.py](../config_local.example.py)); if it is missing or empty,
+a hidden prompt requests the token once at startup. Password environment variables
+are not used by this entry point. Authentication failures propagate without
+retrying with a password.
+
 If the initial request report is empty, the script prints that no requests were
 found, closes the connection, and exits successfully without creating a package.
 
 [create_package_validation_loop.py](../create_package_validation_loop.py) now
 creates the source package and records its contents, creation comment, migration
-reference, and request status `2` only. It does not read `Target Project@NAME` or
-`Target Project@ID`; those columns are no longer required in its report.
+reference, and request status `2` only. Successful package creation does not read
+`Target Project@NAME` or `Target Project@ID`. If package creation fails, however,
+`Target Project@NAME` is required to resolve the numeric project key for the
+failure-history row; `Target Project@ID` is not used.
 
 Target connections, target validation/rebuild retries, validation comments,
 `validation_flag` updates, and validation-result emails are not performed by this
@@ -302,13 +333,32 @@ The script inserts entries into `arms.t_mig_comments` such as:
 - Validation successful
 - Object added to package
 
+If the server rejects package creation because a dependency is missing, the
+server error text (including the missing object's GUID) is recorded unchanged
+in the request comment and in `arms.t_mig_dim_migration.migration_message`.
+The migration history row uses the numeric target-project key resolved from the
+request's `Target Project@NAME` through the configured target-project mapping.
+Single quotes are escaped for SQL storage.
+
 ### 4) Update request status and migration mapping
 
 SQL updates are executed to:
 
-- set request status to `2` (Package Created)
+- set request status to `17` (In Progress) right after the request parameters are read from the report
+- set request status to `5` (Package Created) — only after target validation succeeds
 - write the migration object ID back to `arms.t_mig_lu_migration_obj`
 - set validation flag after validation completes
+
+### Target validation after creation
+
+When the request report contains `Target Project@NAME`, the new package is validated
+against that project right after creation (`import_package._validate_before_import`).
+The target connection uses the `TARGET_ENV_URL` variable at the top of the script
+(set to `BASE_URL` by default; edit it if the test environment has a different URL).
+On `VALIDATION_FAILED` the server message (with missing-dependency GUIDs)
+is printed, saved to `arms.t_mig_comments` and `arms.t_mig_dim_migration.migration_message`,
+the request status is left unchanged, and the script raises. Without a target project
+name, validation is skipped.
 
 ---
 

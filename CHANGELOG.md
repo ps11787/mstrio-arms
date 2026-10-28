@@ -4,6 +4,8 @@
 
 ### Create Package Workflow
 
+- Eine separate ARMS-Lookup-Tabelle für 228 MicroStrategy-Objekttypen wurde ergänzt. Sie enthält kanonische Typnamen passend zu `t_mig_dim_objects.type`, Beschreibungen, Haupttyp-Zuordnungen und Kennzeichen für Subtypen, erforderliche Abhängigkeiten und Schemaobjekte. Damit kann der Objekttyp als Attribut für die weitere Dataset-Modellierung verwendet werden.
+- Die DDL für `arms.t_mig_lu_object_type` wurde in `arms_table_definitions.sql` aufgenommen; `arms_object_type_lookup.sql` erstellt und befüllt die Lookup-Tabelle.
 - Die Erstellung eines Migration Packages bricht nicht mehr ab, wenn `Migration Obj@GUID` leer ist oder das Migrationsobjekt auf dem Server nicht mehr vorhanden ist.
 - Ein bestehendes Migrationsobjekt wird nur dann gelöscht, wenn es erfolgreich geladen werden kann. Andernfalls wird ein neues Package erstellt, ohne das alte Objekt zu zerstören.
 - Die Abhängigkeitsauflösung für Shortcut-Ziele wurde erweitert: Rekursiv werden alle relevanten Abhängigkeiten wie Metriken, Datasets, Reports, Filter und Prompts berücksichtigt.

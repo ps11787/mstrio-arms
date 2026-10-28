@@ -11,9 +11,14 @@ import re
 from time import sleep
 from mstrio.connection import Connection
 
+try:
+    import config_local as _local_config
+except ImportError:
+    _local_config = None
+
 BASE_URL = os.getenv("MSTR_BASE_URL", "https://env-371825.ma.cloud.microstrategy.com/MicroStrategyLibrary")
-MSTR_USERNAME = os.getenv("MSTR_USERNAME", "mstr")
-MSTR_PASSWORD = os.getenv("MSTR_PASSWORD", "EW85AcqE1SoT")
+MSTR_USERNAME = os.getenv("MSTR_USERNAME", getattr(_local_config, "MSTR_USERNAME", "mstr"))
+MSTR_PASSWORD = os.getenv("MSTR_PASSWORD", getattr(_local_config, "MSTR_PASSWORD", ""))
 PROJECT_ID = os.getenv("MSTR_PROJECT_ID", "4B0544627D49F8DA03C26D817D208263")
 DATASOURCE_INSTANCE_ID = os.getenv("MSTR_DATASOURCE_INSTANCE_ID", "A23BBC514D336D5B4FCE919FE19661A3")
 REQUEST_REPORT_ID = os.getenv("MSTR_REQUEST_REPORT_ID", "A62CDD7147492E20EE83C5841B7C9183")
