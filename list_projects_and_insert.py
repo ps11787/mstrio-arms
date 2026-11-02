@@ -33,6 +33,7 @@ DEFAULT_LOGIN_MODE = 1
 DEFAULT_DATASOURCE_NAME = "ARMS_WH"
 DEFAULT_TABLE_NAME = "arms.t_mig_lu_project"
 DEFAULT_TGT_TABLE_NAME = "arms.t_mig_lu_tgt_project"
+DEFAULT_PROJECT_ENVIRONMENT = "dev"
 DEFAULT_STATUS_TABLE_NAME = "arms.t_mig_lu_status"
 STATUS_LOOKUP = [
     (1, "Create Package"),
@@ -69,6 +70,28 @@ def _escape_sql_literal(value: str) -> str:
     return value.replace("'", "''")
 
 
+def _get_project_environment(project: dict[str, Any]) -> str | None:
+    project_name = str(project.get("name", "")).strip()
+    if project_name.lower().startswith("e01 - ") or project_name.lower() == "release management":
+        return DEFAULT_PROJECT_ENVIRONMENT
+    return None
+
+
+def _ensure_project_environment_column(
+    datasource: DatasourceInstance, query_project_id: str
+) -> None:
+    statements = (
+        f"ALTER TABLE {DEFAULT_TABLE_NAME} ADD COLUMN IF NOT EXISTS prj_env VARCHAR",
+        f"UPDATE {DEFAULT_TABLE_NAME} SET prj_env = '{DEFAULT_PROJECT_ENVIRONMENT}' "
+        "WHERE LOWER(project_name) LIKE 'e01 - %' "
+        "OR LOWER(project_name) = 'release management'",
+    )
+    for statement in statements:
+        result = datasource.execute_query(project_id=query_project_id, query=statement)
+        print(f"[SQL] {statement}")
+        print(f"  -> execution status: {result.get('status')}")
+
+
 def _get_existing_project_guids(
     datasource: DatasourceInstance, query_project_id: str
 ) -> tuple[set[str], int]:
@@ -84,12 +107,17 @@ def _get_existing_project_guids(
 
 
 def _build_insert_statement(project: dict[str, Any], project_id: int) -> str:
-    # TODO: column mapping for env_id/project_source_id/etc. is not defined yet.
     guid = _escape_sql_literal(str(project.get("id", "")))
     name = _escape_sql_literal(str(project.get("name", "")))
+    project_environment = _get_project_environment(project)
+    environment_value = (
+        f"'{_escape_sql_literal(project_environment)}'"
+        if project_environment
+        else "NULL"
+    )
     return (
-        f"INSERT INTO {DEFAULT_TABLE_NAME} (project_id, project_guid, project_name) "
-        f"VALUES ({project_id}, '{guid}', '{name}')"
+        f"INSERT INTO {DEFAULT_TABLE_NAME} (project_id, project_guid, project_name, prj_env) "
+        f"VALUES ({project_id}, '{guid}', '{name}', {environment_value})"
     )
 
 
@@ -171,6 +199,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         query_project_id = args.query_project_id or projects[0]["id"]
         datasource = DatasourceInstance(connection=connection, name=args.datasource_name)
+        _ensure_project_environment_column(datasource, query_project_id)
 
         existing_status_ids = _get_existing_status_ids(datasource, query_project_id)
         new_statuses = [
