@@ -1,5 +1,17 @@
 # Documentation for create_package.py
 
+## Run the validation-enabled standalone copy
+
+Run [create_package_workstation.py](../create_package_workstation.py) directly
+with Python. Configure `BASE_URL`, `LOGIN`, and `PASSWORD` near the top of the
+script; these values are used for ARMS, source-project, and (when validation is
+enabled) target-project connections.
+
+This copy retains the validation and missing-object retry flow from
+[create_package.py](../create_package.py). Set `ENABLE_VALIDATION = True` near
+the top of the script to turn on target validation; otherwise the package is
+created without target validation.
+
 ## Creation-only workflow in create_package_validation_loop.py
 
 ### Run from Workstation
