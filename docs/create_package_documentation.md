@@ -12,6 +12,11 @@ This copy retains the validation and missing-object retry flow from
 the top of the script to turn on target validation; otherwise the package is
 created without target validation.
 
+If the request report is empty, the script prints that no requests were found,
+closes the connection, and returns without creating a package or writing to ARMS.
+The script entry point returns normally instead of raising `SystemExit`, which
+Workstation reports as a script evaluation failure even with exit code `0`.
+
 ## Creation-only workflow in create_package_validation_loop.py
 
 ### Run from Workstation

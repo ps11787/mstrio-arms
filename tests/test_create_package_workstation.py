@@ -1,9 +1,37 @@
+import runpy
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pandas as pd
 
 import create_package_workstation as script
 from mstrio.object_management.migration.package import ValidationStatus
+
+
+def test_empty_report_stops_script_without_system_exit(monkeypatch, capsys):
+    connection = Mock()
+    connect = Mock(return_value=connection)
+    datasource = Mock()
+    report = Mock()
+    report.to_dataframe.return_value = pd.DataFrame()
+    monkeypatch.setattr("mstrio.connection.Connection", connect)
+    monkeypatch.setattr(
+        "mstrio.datasources.datasource_instance.DatasourceInstance",
+        Mock(return_value=datasource),
+    )
+    monkeypatch.setattr(
+        "mstrio.project_objects.report.Report",
+        Mock(return_value=report),
+    )
+
+    runpy.run_path(script.__file__, run_name="__main__")
+
+    connect.assert_called_once_with(
+        script.BASE_URL, script.LOGIN, script.PASSWORD, project_id=script.PROJECT_ID,
+    )
+    connection.close.assert_called_once_with()
+    datasource.execute_query.assert_not_called()
+    assert "No requests found in the request report. No package will be created." in capsys.readouterr().out
 
 
 def test_configured_credentials_are_used_for_package_and_target_validation(monkeypatch):
