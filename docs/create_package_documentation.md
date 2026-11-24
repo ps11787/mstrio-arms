@@ -7,6 +7,11 @@ with Python. Configure `BASE_URL`, `LOGIN`, and `PASSWORD` near the top of the
 script; these values are used for ARMS, source-project, and (when validation is
 enabled) target-project connections.
 
+It can also run in Workstation's Python Scripts interface with the same
+configured credentials. Successful execution finishes normally rather than
+raising `SystemExit(0)`, which Workstation reports as a script evaluation failure.
+Actual errors still propagate and are reported as failures.
+
 This copy retains the validation and missing-object retry flow from
 [create_package.py](../create_package.py). Set `ENABLE_VALIDATION = True` near
 the top of the script to turn on target validation; otherwise the package is

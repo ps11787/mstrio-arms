@@ -1,9 +1,35 @@
+import ast
+from pathlib import Path
 from types import SimpleNamespace
 
 import pandas as pd
+import pytest
 
 import create_package_workstation as script
 from mstrio.object_management.migration.package import ValidationStatus
+
+
+@pytest.mark.parametrize("result", [0, RuntimeError("Package creation failed")])
+def test_workstation_entry_point_finishes_normally_or_propagates_failure(result):
+    source = Path(script.__file__).read_text()
+    entry_point = ast.parse(source).body[-1]
+    calls = []
+
+    def main():
+        calls.append(True)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    code = compile(ast.Module(body=[entry_point], type_ignores=[]), script.__file__, "exec")
+    namespace = {"__name__": "__main__", "main": main}
+    if isinstance(result, Exception):
+        with pytest.raises(RuntimeError, match="Package creation failed"):
+            exec(code, namespace)
+    else:
+        exec(code, namespace)
+
+    assert calls == [True]
 
 
 def test_configured_credentials_are_used_for_package_and_target_validation(monkeypatch):
